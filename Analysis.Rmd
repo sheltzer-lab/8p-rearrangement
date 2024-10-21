@@ -1,0 +1,684 @@
+---
+title: "Chromosome engineering to restore euploidy in cells harboring a complex rearrangement of chromosome 8"
+subtitle: "Computational Analysis"
+author: "Lu Qiao"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  autodep = TRUE,
+  cache.lazy = FALSE,
+  fig.width = 10,
+  fig.height = 7.75,
+  message = FALSE
+)
+```
+
+
+### Load Libraries
+```{r load library, message=FALSE, warning=FALSE}
+library("readxl")
+library("tidyverse") 
+library("edgeR")        
+library("clusterProfiler")
+library("org.Hs.eg.db") 
+library("enrichplot")   
+library("msigdbr")
+library("biomaRt")
+```
+
+## Analysis on Altered Region
+### Ensembl GRCh38
+```{r}
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+# region of interest
+chromosome_of_interest <- "8"
+deletion_start <- 0
+deletion_end <- 7247573
+duplication_start <- 11828865
+duplication_end <- 40361770
+
+attributes <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "chromosome_name",
+  "start_position",
+  "end_position",
+  "strand",
+  "gene_biotype"
+)
+
+# deletion region
+filters_del <- c("chromosome_name", "start", "end")
+values_del <- list(chromosome_of_interest, deletion_start, deletion_end)
+
+genes_in_deletion <- getBM(
+  attributes = attributes,
+  filters = filters_del,
+  values = values_del,
+  mart = ensembl
+)
+
+protein_coding_genes_del <- genes_in_deletion[genes_in_deletion$gene_biotype == "protein_coding", ]
+number_of_genes_del <- length(unique(protein_coding_genes_del$ensembl_gene_id))
+cat("Number of protein-coding genes in the deletion region:", number_of_genes_del, "\n")
+
+# duplication region
+filters_dup <- c("chromosome_name", "start", "end")
+values_dup <- list(chromosome_of_interest, duplication_start, duplication_end)
+
+genes_in_duplication <- getBM(
+  attributes = attributes,
+  filters = filters_dup,
+  values = values_dup,
+  mart = ensembl
+)
+
+protein_coding_genes_dup <- genes_in_duplication[genes_in_duplication$gene_biotype == "protein_coding", ]
+number_of_genes_dup <- length(unique(protein_coding_genes_dup$ensembl_gene_id))
+cat("Number of protein-coding genes in the duplication region:", number_of_genes_dup, "\n")
+
+
+protein_coding_genes_del$region <- "Deletion"
+protein_coding_genes_dup$region <- "Duplication"
+combined_genes <- rbind(protein_coding_genes_del, protein_coding_genes_dup)
+combined_genes
+
+overlapping_genes <- intersect(protein_coding_genes_del$ensembl_gene_id, protein_coding_genes_dup$ensembl_gene_id)
+if (length(overlapping_genes) > 0) {
+  cat("Genes present in both regions:\n")
+  print(overlapping_genes)
+} else {
+  cat("No genes are present in both the deletion and duplication regions.\n")
+}
+```
+
+## Differential Expression analysis
+### prepare input data
+```{r prepare input data}
+counts <- read.csv("gene_count.csv")
+samples <- read_xlsx("Sample List.xlsx")
+raw.counts <- counts %>% dplyr::select(gene_id, samples$`Sample Name`)
+annotation <- counts %>% dplyr::select(-all_of(samples$`Sample Name`))
+```
+
+### define functions
+```{r functions}
+get_results <- function(contrast, qlf, p_value = 0.05, n_top = Inf) {
+  # identify significant DE genes
+  is.de <- decideTests(qlf, p.value = p_value)
+  summary_de <- summary(is.de)
+  top_tags <- topTags(qlf, n = n_top)
+  upregulated <- sum(is.de == 1)
+  downregulated <- sum(is.de == -1)
+  no_change <- sum(is.de == 0)
+  
+  # apply a threshold for DE genes
+  thresholded_results <- top_tags$table[
+  top_tags$table$FDR <= 0.05 & abs(top_tags$table$logFC) >= 1.0, ]
+  
+  return(list(
+    contrast = contrast,
+    qlf = qlf,
+    is_de = is.de,
+    summary_de = summary_de,
+    top_tags = top_tags,
+    upregulated = upregulated,
+    downregulated = downregulated,
+    no_change = no_change,
+    thresholded_results = thresholded_results
+  ))
+}
+
+# Function to plot multiple group comparisons
+plot_all_results <- function(results_list) {
+  plot_data <- do.call(rbind, lapply(results_list, function(result) {
+    data.frame(
+      Category = c("Upregulated", "Downregulated", "No Change"),
+      Count = c(result$upregulated, result$downregulated, result$no_change),
+      Comparison = result$contrast
+    )
+  }))
+  
+  plot <- ggplot(plot_data, aes(x = Comparison, y = Count, fill = Category)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = Count), 
+              position = position_dodge(width = 0.9), 
+              vjust = -0.5) +
+    labs(title = "Differential Expression Across Comparisons",
+         x = "Comparison",
+         y = "Number of Genes") +
+    theme_minimal() +
+    scale_fill_manual(values = c("Upregulated" = "green", "Downregulated" = "red", "No Change" = "gray"))
+
+  print(plot)
+}
+
+plot_thresholded_results <- function(results_list) {
+  plot_data <- lapply(results_list, function(result) {
+    thresholded_results <- result$thresholded_results
+    # Count the number of upregulated genes (logFC >= 1.0)
+    upregulated_genes <- thresholded_results[thresholded_results$logFC >= 1.0 & thresholded_results$FDR <= 0.05, ]
+    num_upregulated <- nrow(upregulated_genes)
+    # Count the number of downregulated genes (logFC <= -1.0)
+    downregulated_genes <- thresholded_results[thresholded_results$logFC <= -1.0 & thresholded_results$FDR <= 0.05, ]
+    num_downregulated <- nrow(downregulated_genes)
+    
+    all <- num_downregulated + num_upregulated
+   
+    data.frame(
+      Category = c("Upregulated", "Downregulated", "ALL"),
+      Count = c(num_upregulated, num_downregulated, all),
+      Comparison = result$contrast
+    )
+  })
+
+  plot_data <- do.call(rbind, plot_data)
+  plot <- ggplot(plot_data, aes(x = Comparison, y = Count, fill = Category)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = Count), 
+              position = position_dodge(width = 0.9), 
+              vjust = -0.5) +  # Adds numbers on top of bars
+    labs(title = "Differential Expression Across Comparisons (padj <= 0.05 or |logFC| >= 1.0) ",
+         x = "Comparison",
+         y = "Number of Genes") +
+    theme_minimal() +
+    scale_fill_manual(values = c("Upregulated" = "green", "Downregulated" = "red", "ALL" = "gray"))
+  
+  print(plot)
+  return(plot_data)
+}
+```
+
+### analysis
+```{r, DE analysis - PRO vs Parents, PRO vs REV}
+samples.parents <- samples %>%
+  mutate(`Group Name` = ifelse(`Group Name` %in% c("MOM", "DAD"), "Parents", `Group Name`))
+print(samples.parents)
+
+y.parents <- DGEList(counts = raw.counts, samples = samples.parents, group = samples.parents$`Group Name`)
+y.parents$genes <- annotation
+keep <- filterByExpr(y.parents, min.count = 30, min.total.count = 50, large.n = 10, min.prop = 0.75) # filter lowly expressed transcripts
+table(keep)
+y.parents <- y.parents[keep, , keep.lib.sizes=FALSE]
+y.parents <- normLibSizes(y.parents) # TMM normalization
+# calculate CPM 
+log2_cpm <- cpm(y.parents, log = TRUE, prior.count = 1, normalized.lib.sizes = T)
+cpm_counts<-cpm(y.parents, normalized.lib.sizes = T) 
+tmm_data_with_annotations <- cbind(y.parents$genes, cpm_counts)
+log2_tmm_data_with_annotations <- cbind(y.parents$genes, log2_cpm)
+
+colnames(log2_cpm) <- samples$`Cell line`
+gene_annotations <- data.frame(GeneID = y.parents$genes$gene_id, Description = y.parents$genes$gene_description)
+gsea.input <- cbind(gene_annotations, log2_cpm)
+write.table(gsea.input, file="log2_TMM_normalized_counts.txt", 
+            sep="\t", quote=FALSE, row.names=FALSE)
+colnames(cpm_counts) <- samples$`Cell line`
+gene_annotations <- data.frame(GeneID = y.parents$genes$gene_id, Description = y.parents$genes$gene_description)
+gsea.input <- cbind(gene_annotations, cpm_counts)
+write.table(gsea.input, file="TMM_normalized_counts.txt", 
+            sep="\t", quote=FALSE, row.names=FALSE)
+
+# DE analysis
+plotMDS(y.parents)        
+samples.design.parents <- model.matrix(~ 0 + group,data = y.parents$samples) # design
+colnames(samples.design.parents) <- gsub("group", "", colnames(samples.design.parents))
+y.parents <- estimateDisp(y.parents, samples.design.parents, robust=TRUE)
+print(y.parents$common.dispersion)
+plotBCV(y.parents)
+fit.parents <- glmQLFit(y.parents, samples.design.parents, robust=TRUE)
+plotQLDisp(fit.parents)
+# make contrast
+parent.contrast <- makeContrasts(PROvsParents=PRO-Parents, levels=samples.design.parents)
+parent.contrast2 <- makeContrasts(PROvsREV=PRO-REV, levels=samples.design.parents)
+
+qlf.PROvsParents <- glmQLFTest(fit.parents, contrast=parent.contrast[,"PROvsParents"])
+qlf.PROvsREV2 <- glmQLFTest(fit.parents, contrast=parent.contrast2[,"PROvsREV"])
+contr.parents <- get_results("PRO - Parents", qlf.PROvsParents)
+contr.parents2 <- get_results("PRO - REV", qlf.PROvsREV2)
+
+parents_results_list <- list(contr.parents,contr.parents2)
+plot_all_results(parents_results_list)
+table.results <- plot_thresholded_results(parents_results_list)
+```
+
+## GSEA
+### import data
+```{r GSEA - import input}
+ranked_data_PRO_versus_REV <- read.table("ranked_gene_list_PRO_versus_REV_1728681059442.tsv", 
+                          header = TRUE, 
+                          sep = "\t", 
+                          quote = "",
+                          fill = TRUE,
+                          comment.char = "")
+
+# import gene set
+H_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene, gs_description)
+C5_t2g <- msigdbr(species = "Homo sapiens", category = "C5") %>% 
+  dplyr::select(gs_name, entrez_gene, gs_description)
+C2_t2g <- msigdbr(species = "Homo sapiens", category = "C2") %>% 
+  dplyr::select(gs_name, entrez_gene, gs_description)
+```
+
+### analysis
+```{r GSEA PRO_versus_REV}
+pvalue_cutoff <- 0.05
+n_permutations <- 100000
+ranked_genes <- setNames(ranked_data_PRO_versus_REV$SCORE, ranked_data_PRO_versus_REV$NAME)
+# Map to Entrez IDs
+entrez_ids <- mapIds(org.Hs.eg.db, 
+                     keys = names(ranked_genes), 
+                     column = "ENTREZID", 
+                     keytype = "SYMBOL", 
+                     multiVals = "first")
+  
+# Remove unmapped genes 
+ranked_genes_entrez <- ranked_genes[!is.na(entrez_ids)]
+names(ranked_genes_entrez) <- entrez_ids[!is.na(entrez_ids)]
+  
+# Resolve ties by adding a small random number
+ranked_genes_entrez <- ranked_genes_entrez + runif(length(ranked_genes_entrez), min = -1e-5, max = 1e-5)
+
+ranked_genes_entrez <- sort(ranked_genes_entrez, decreasing = TRUE)
+
+GSEA_H <- GSEA(geneList = ranked_genes_entrez,
+                    TERM2GENE = H_t2g,       
+                    pvalueCutoff = pvalue_cutoff,   
+                    eps = 0,                     
+                    nPermSimple = n_permutations, 
+                    minGSSize = 15,                 
+                    maxGSSize = 500,              
+                    verbose = TRUE)
+GSEA_C5 <- GSEA(geneList = ranked_genes_entrez, 
+                    TERM2GENE = C5_t2g,         
+                    pvalueCutoff = pvalue_cutoff,   
+                    eps = 0,                        
+                    nPermSimple = n_permutations,   
+                    minGSSize = 15,                  
+                    maxGSSize = 500,              
+                    verbose = TRUE)
+GSEA_C2 <- GSEA(geneList = ranked_genes_entrez,  
+                    TERM2GENE = C2_t2g,          
+                    pvalueCutoff = pvalue_cutoff,   
+                    eps = 0,                         
+                    nPermSimple = n_permutations,   
+                    minGSSize = 15,                
+                    maxGSSize = 500,              
+                    verbose = TRUE)
+
+```
+## Manuscript Figures
+### Figure 5
+```{r Constants for Plots}
+sample_to_group <- samples %>%
+  dplyr::select(`Sample Name`, `Group Name`)
+
+library(MetBrewer)
+library(ggthemes)
+annotation_colors <- met.brewer("Cassatt1", n = 8, type = "discrete")  # Select red and blue shades
+del_shade <- annotation_colors[5]
+dup_shade <- annotation_colors[4]
+centr_shade <- annotation_colors[8]
+```
+#### Figure 5A
+```{r Figure 5A}
+custom_rollmean <- function(x, k = 40) {
+  n <- length(x)
+  half_window <- k / 2
+  
+  rolling_avg <- rep(NA, n)  # Initialize the rolling average vector
+  
+  # First half (start) of the series: fewer previous values
+  for (i in 1:half_window) {
+    rolling_avg[i] <- mean(x[1:(i + half_window)], na.rm = TRUE)
+  }
+  
+  # Middle part: use full window size
+  for (i in (half_window + 1):(n - half_window)) {
+    rolling_avg[i] <- mean(x[(i - half_window):(i + half_window)], na.rm = TRUE)
+  }
+  
+  # Last half (end) of the series: fewer subsequent values
+  for (i in (n - half_window + 1):n) {
+    rolling_avg[i] <- mean(x[(i - half_window):n], na.rm = TRUE)
+  }
+  
+  return(rolling_avg)
+}
+
+gene.deldup.tmm <- log2_tmm_data_with_annotations %>%
+  filter(gene_chr == "8") %>%
+  dplyr::select(gene_id, gene_start, gene_end, samples$`Sample Name`) %>%
+  pivot_longer(cols = -c(gene_id, gene_start, gene_end), names_to = "Sample", values_to = "Expression") %>%
+  left_join(sample_to_group, by = c("Sample" = "Sample Name")) %>%  # Map samples to their groups
+  group_by(gene_id, gene_start, gene_end, `Group Name`) %>%
+  summarise(Average_Expression = mean(Expression, na.rm = TRUE), .groups = "drop") %>%
+  arrange(gene_start, desc(Average_Expression))
+
+
+gene.deldup.tmm.plot.relative.PRO <- gene.deldup.tmm %>%
+  mutate(region = case_when(
+    gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_start >= deletion_end & gene_start < duplication_start ~ "Region between invdupdel",
+    gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    gene_start >= duplication_end & gene_start < 44033745  ~ "Region from dup to centromere",
+    gene_start >= 45877265 ~ "8q"
+  )) %>%
+  filter(`Group Name` %in% c('PRO', 'REV')) %>%  # Filter for PRO and REV
+  tidyr::pivot_wider(names_from = `Group Name`, values_from = Average_Expression) %>%
+  # Calculate relative expression as PRO average minus REV average
+  mutate(relative_expression = PRO - REV) %>%
+  group_by(region) %>%
+  mutate(rolling_avg = custom_rollmean(relative_expression, k = 14)) %>%
+  ungroup()
+
+library(grid)
+text_del <- textGrob("Deletion", gp=gpar(fontsize=18, fontface="bold"))
+text_dup <- textGrob("Duplication", gp=gpar(fontsize=18, fontface="bold"))
+text_cen <- textGrob("Centromere", gp=gpar(fontsize=18, fontface="bold"))
+
+plot_object <- ggplot(gene.deldup.tmm.plot.relative.PRO, aes(x = (gene_start+gene_end)/2, y = rolling_avg)) +
+  theme(plot.margin = unit(c(1,1,2,1), "lines")) +
+  annotate("rect", xmin = deletion_start, xmax = deletion_end, ymin = -Inf, ymax = Inf, 
+           fill = del_shade, alpha = 0.8) +  # Red box for deletion region
+  annotate("rect", xmin = duplication_start, xmax = duplication_end, ymin = -Inf, ymax = Inf, 
+           fill = dup_shade, alpha = 0.8) +  # Blue box for duplication region
+  geom_rect(aes(xmin = 44033745, xmax = 45877265, ymin = -Inf, ymax = Inf), 
+            fill = "grey", color = "grey", alpha = 0.6) +
+  annotation_custom(text_del,xmin=(deletion_start + deletion_end) / 2,xmax=(deletion_start + deletion_end) / 2,ymin=-1.95,ymax=-1.95) + 
+  annotation_custom(text_dup,xmin=(duplication_start + duplication_end) / 2,xmax=(duplication_start + duplication_end) / 2,ymin=-1.95,ymax=-1.95) +
+  annotation_custom(text_cen,xmin=(44033745 + 45877265) / 2,xmax=(44033745 + 45877265) / 2,ymin=-1.95,ymax=-1.95) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 0.5, alpha = 0.8 ) +
+  geom_point(size = 1.5, alpha = 0.9, color = "#727572") + 
+  labs(
+    title = "Gene Expression on Chromosome 8 - Proband relative to Revertant",
+    x = "Chromosome Position (bp)",
+    y = "Relative Expression Level (log2)",
+    color =NULL
+  ) +
+  scale_y_continuous(limits = c(-1.5, 1.5), breaks = seq(-1.5, 1.5, by = 0.5)) +
+  scale_x_continuous(expand = c(0, 0), breaks = seq(from = 0, to = max(gene.deldup.tmm.plot.relative.PRO$gene_end), by = 2e7)) +
+  theme_classic() +
+  coord_cartesian(clip = "off") +
+  theme(
+    text = element_text(family = "Arial", face = "bold"),
+    plot.title = element_text(size = 28, face = "bold", hjust = 0.5, family = "Arial"),
+    axis.title = element_text(size = 20, family = "Arial"),                
+    axis.text = element_text(size = 18, family = "Arial"),
+    axis.title.x = element_text(margin = margin(t = 20)),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) 
+
+print(plot_object)
+
+ggsave(
+  filename = "gene_expression_plot_log2_PROvsREV.png",
+  plot = plot_object,
+  width = 18,   # Adjust the width to make the canvas longer
+  height = 6,   # Adjust the height to control the aspect ratio
+  dpi = 300,     # Set the resolution to 300 dpi
+  bg = "transparent"
+)
+
+# calculate mean expression
+mean_values <- gene.deldup.tmm.plot.relative.PRO %>%
+  group_by(region) %>%
+  summarize(REV_mean = mean(REV, na.rm = TRUE),
+            PRO_mean = mean(PRO, na.rm = TRUE)) %>%
+  mutate(abs_fold_change = 2^(PRO_mean - REV_mean))
+
+mean_values
+```
+
+#### Figure 5B
+```{r Figure5B}
+# PRO vs REV
+plot_tmp1 <- contr.parents2$top_tags$table %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  )) %>%
+  filter(FDR <= 0.05, abs(logFC) >= 1.0)
+
+region_counts1 <- plot_tmp1 %>%
+  group_by(region) %>%
+  summarise(count = n())
+
+# PRO vs Parents
+plot_tmp2 <- contr.parents$top_tags$table %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  )) %>%
+  filter(FDR <= 0.05, abs(logFC) >= 1.0)
+
+
+region_counts2 <- plot_tmp2 %>%
+  group_by(region) %>%
+  summarise(count = n())
+
+combined_counts <- region_counts1 %>%
+  left_join(region_counts2, by = "region", suffix = c(".PROvsREV", ".PROvsParents"))
+
+long_counts <- combined_counts %>%
+  pivot_longer(cols = starts_with("count"), names_to = "dataset", values_to = "count")
+
+
+# Plot the counts side-by-side
+ggplot(long_counts, aes(x = region, y = count, fill = dataset)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  labs(title = "Region Counts - PRO vs Parents", x = "Region", y = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_log10() +
+  geom_text(aes(label = round(count, 2)), 
+            position = position_dodge(width = 0.8), vjust = -0.5, size = 3)
+
+# Chi-square
+region <- log2_tmm_data_with_annotations %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  ))
+
+value_counts <- region %>%
+  count(region, sort = TRUE)
+
+# chi square
+del <- value_counts %>%
+  filter(region == "deletion") %>%
+  pull(n)
+dup <- value_counts %>%
+  filter(region == "duplication") %>%
+  pull(n)
+other <- value_counts %>%
+  filter(region == "other") %>%
+  pull(n)
+
+del.PRO.Parents <- region_counts2 %>%
+  filter(region == "deletion") %>%
+  pull(count)
+del.PRO.REV <- region_counts1 %>%
+  filter(region == "deletion") %>%
+  pull(count)
+
+dup.PRO.Parents <- region_counts2 %>%
+  filter(region == "duplication") %>%
+  pull(count)
+dup.PRO.REV <- region_counts1 %>%
+  filter(region == "duplication") %>%
+  pull(count)
+
+other.PRO.Parents <- region_counts2 %>%
+  filter(region == "other") %>%
+  pull(count)
+other.PRO.REV <- region_counts1 %>%
+  filter(region == "other") %>%
+  pull(count)
+
+contingency.del <- matrix(c(del.PRO.Parents, del - del.PRO.Parents, del.PRO.REV, del - del.PRO.REV),
+                            nrow = 2, byrow = TRUE,
+                            dimnames = list(c("PRO.Parents", "PRO.REV"),
+                                            c("DE", "nonDE")))
+
+contingency.dup <- matrix(c(dup.PRO.Parents, dup - dup.PRO.Parents, dup.PRO.REV, dup - dup.PRO.REV),
+                            nrow = 2, byrow = TRUE,
+                            dimnames = list(c("PRO.Parents", "PRO.REV"),
+                                            c("DE", "nonDE")))
+
+
+contingency.other <- matrix(c(other.PRO.Parents, other - other.PRO.Parents, other.PRO.REV, other - other.PRO.REV),
+                            nrow = 2, byrow = TRUE,
+                            dimnames = list(c("PRO.Parents", "PRO.REV"),
+                                            c("DE", "nonDE")))
+del_result <- chisq.test(contingency.del, correct = FALSE) %>% 
+  broom::tidy() %>% 
+  mutate(test = "Deletion")
+
+dup_result <- chisq.test(contingency.dup, correct = FALSE) %>% 
+  broom::tidy() %>% 
+  mutate(test = "Duplication")
+
+other_result <- chisq.test(contingency.other, correct = FALSE) %>% 
+  broom::tidy() %>% 
+  mutate(test = "Other")
+
+chi_results <- bind_rows(del_result, dup_result, other_result) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+chi_results
+```
+
+#### Figure 5C
+```{r Figure5C}
+genes <- c("DLGAP2", "CSMD1","RHOBTB2", "CHRNA2", "GATA4", "XKR6")
+plot.genelist <- c("MCPH1", "CLN8", "RHOBTB2", "UNC5D", "CNTN4", "NAV3")
+
+plot_tmp <- contr.parents2$top_tags$table %>%
+  dplyr::select(gene_name, logFC, logCPM, FDR, gene_start, gene_end, gene_chr, gene_biotype) %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  )) %>%
+  filter(FDR <= 0.05, gene_name %in% plot.genelist)
+
+ggplot(plot_tmp, aes(x = gene_name, y = logFC, fill = region)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  labs(title = "Differential Expression by Region", 
+       x = "Gene", y = "logFC") +
+  theme_minimal() +
+  geom_text(aes(label = round(logFC, 2)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, size = 3) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+#### Figure 5D
+```{r Figure5D}
+pathways <- c("REACTOME_DNA_METHYLATION", "REACTOME_ACTIVATION_OF_ANTERIOR_HOX_GENES_IN_HINDBRAIN_DEVELOPMENT_DURING_EARLY_EMBRYOGENESIS", "REACTOME_SEMA4D_INDUCED_CELL_MIGRATION_AND_GROWTH_CONE_COLLAPSE", "REACTOME_TRANSLATION")
+
+for (id in pathways) {
+    if (id %in% GSEA_H@result$ID) {
+        name <- GSEA_H@result[id, "Description"]
+        plot <- gseaplot2(GSEA_H, geneSetID = id)
+        print(plot)
+        print(id)
+        ggsave(filename = paste0("Enrichment_Plot_", id, "_H.png"), plot = plot, width = 4, height = 4, dpi = 300)
+        
+    } else if (id %in% GSEA_C2@result$ID) {
+        name <- GSEA_C2@result[id, "Description"]
+        plot <- gseaplot2(GSEA_C2, geneSetID = id)
+        print(plot)
+        print(id)
+        ggsave(filename = paste0("Enrichment_Plot_", id, "_C2.png"), plot = plot, width = 4, height = 4, dpi = 300)
+        
+    } else if (id %in% GSEA_C5@result$ID) {
+        name <- GSEA_C5@result[id, "Description"]
+        plot <- gseaplot2(GSEA_C5, geneSetID = id) 
+        print(plot)
+        print(id)
+        ggsave(filename = paste0("Enrichment_Plot_", id, "_C5.png"), plot = plot, width = 4, height = 4, dpi = 300)
+        
+    } else {
+        print(paste("Pathway", id, "not found in any GSEA results."))
+    }
+}
+
+```
+
+#### Supplementary Tables
+```{r Supplementary Tables}
+DEgenes361 <- contr.parents2$top_tags$table %>%
+  filter(FDR <= 0.05, abs(logFC) >= 1.0) %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  ))
+DEgenesAll <- contr.parents2$top_tags$table %>%
+  filter(FDR <= 0.05) %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  ))
+write_csv(DEgenesAll, "DEgenesPROvsREV-all.csv")
+
+genesAll <- contr.parents2$top_tags$table %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  ))
+write_csv(genesAll, "genesPROvsREV-all.csv")
+
+gsea_h_df <- as.data.frame(GSEA_H@result) %>%
+  left_join(H_t2g %>%
+              dplyr::select(gs_name, gs_description) %>%
+              distinct(), 
+            by = c("ID" = "gs_name")) %>%
+  mutate(geneset = "Hallmark")
+gsea_c5_df <- as.data.frame(GSEA_C5@result) %>%
+  left_join(C5_t2g%>%
+              dplyr::select(gs_name, gs_description) %>%
+              distinct(), 
+            by = c("ID" = "gs_name")) %>%
+  mutate(geneset = "C5")
+gsea_c2_df <- as.data.frame(GSEA_C2@result) %>%
+  left_join(C2_t2g %>%
+              dplyr::select(gs_name, gs_description) %>%
+              distinct(), 
+            by = c("ID" = "gs_name")) %>%
+  mutate(geneset = "C2")
+GSEA_result_PRO_versus_REV <- bind_rows(gsea_h_df, gsea_c5_df, gsea_c2_df) %>%
+  arrange(enrichmentScore)
+
+GSEA_table <- GSEA_result_PRO_versus_REV %>%
+  dplyr::select(-c(Description, gs_description)) %>%
+  dplyr::rename("MSigDB_gene_sets" = geneset)
+write_csv(GSEA_table, "gseaPROvsREV-all.csv")
+```
+
+## Session Info and Citations
+```{r}
+sessionInfo()
+packages_in_use <- c( names( sessionInfo()$otherPkgs ) )
+the_citations_list <- lapply( X=packages_in_use, FUN=citation)
+the_citations_list
+```

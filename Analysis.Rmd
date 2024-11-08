@@ -236,18 +236,21 @@ colnames(samples.design.parents) <- gsub("group", "", colnames(samples.design.pa
 y.parents <- estimateDisp(y.parents, samples.design.parents, robust=TRUE)
 print(y.parents$common.dispersion)
 plotBCV(y.parents)
+
 fit.parents <- glmQLFit(y.parents, samples.design.parents, robust=TRUE)
 plotQLDisp(fit.parents)
+
 # make contrast
 parent.contrast <- makeContrasts(PROvsParents=PRO-Parents, levels=samples.design.parents)
-parent.contrast2 <- makeContrasts(PROvsREV=PRO-REV, levels=samples.design.parents)
+rev.contrast <- makeContrasts(PROvsREV=PRO-REV, levels=samples.design.parents)
 
 qlf.PROvsParents <- glmQLFTest(fit.parents, contrast=parent.contrast[,"PROvsParents"])
-qlf.PROvsREV2 <- glmQLFTest(fit.parents, contrast=parent.contrast2[,"PROvsREV"])
-contr.parents <- get_results("PRO - Parents", qlf.PROvsParents)
-contr.parents2 <- get_results("PRO - REV", qlf.PROvsREV2)
+qlf.PROvsREV <- glmQLFTest(fit.parents, contrast=rev.contrast[,"PROvsREV"])
 
-parents_results_list <- list(contr.parents,contr.parents2)
+contr.parents <- get_results("PRO - Parents", qlf.PROvsParents)
+contr.rev <- get_results("PRO - REV", qlf.PROvsREV)
+
+parents_results_list <- list(contr.parents, contr.rev)
 plot_all_results(parents_results_list)
 table.results <- plot_thresholded_results(parents_results_list)
 ```
@@ -326,6 +329,7 @@ sample_to_group <- samples %>%
 
 library(MetBrewer)
 library(ggthemes)
+library(grid)
 annotation_colors <- met.brewer("Cassatt1", n = 8, type = "discrete")  # Select red and blue shades
 del_shade <- annotation_colors[5]
 dup_shade <- annotation_colors[4]
@@ -383,7 +387,7 @@ gene.deldup.tmm.plot.relative.PRO <- gene.deldup.tmm %>%
   mutate(rolling_avg = custom_rollmean(relative_expression, k = 14)) %>%
   ungroup()
 
-library(grid)
+
 text_del <- textGrob("Deletion", gp=gpar(fontsize=18, fontface="bold"))
 text_dup <- textGrob("Duplication", gp=gpar(fontsize=18, fontface="bold"))
 text_cen <- textGrob("Centromere", gp=gpar(fontsize=18, fontface="bold"))
@@ -396,8 +400,8 @@ plot_object <- ggplot(gene.deldup.tmm.plot.relative.PRO, aes(x = (gene_start+gen
            fill = dup_shade, alpha = 0.8) +  # Blue box for duplication region
   geom_rect(aes(xmin = 44033745, xmax = 45877265, ymin = -Inf, ymax = Inf), 
             fill = "grey", color = "grey", alpha = 0.6) +
-  annotation_custom(text_del,xmin=(deletion_start + deletion_end) / 2,xmax=(deletion_start + deletion_end) / 2,ymin=-1.95,ymax=-1.95) + 
-  annotation_custom(text_dup,xmin=(duplication_start + duplication_end) / 2,xmax=(duplication_start + duplication_end) / 2,ymin=-1.95,ymax=-1.95) +
+  annotation_custom(text_del,xmin=(deletion_start + deletion_end) / 2, xmax=(deletion_start + deletion_end) / 2,ymin=-1.95,ymax=-1.95) + 
+  annotation_custom(text_dup,xmin=(duplication_start + duplication_end) / 2, xmax=(duplication_start + duplication_end) / 2,ymin=-1.95,ymax=-1.95) +
   annotation_custom(text_cen,xmin=(44033745 + 45877265) / 2,xmax=(44033745 + 45877265) / 2,ymin=-1.95,ymax=-1.95) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 0.5, alpha = 0.8 ) +
   geom_point(size = 1.5, alpha = 0.9, color = "#727572") + 
@@ -408,7 +412,11 @@ plot_object <- ggplot(gene.deldup.tmm.plot.relative.PRO, aes(x = (gene_start+gen
     color =NULL
   ) +
   scale_y_continuous(limits = c(-1.5, 1.5), breaks = seq(-1.5, 1.5, by = 0.5)) +
-  scale_x_continuous(expand = c(0, 0), breaks = seq(from = 0, to = max(gene.deldup.tmm.plot.relative.PRO$gene_end), by = 2e7)) +
+  scale_x_continuous(expand = c(0, 0), 
+                     limits = c(0, max(gene.deldup.tmm.plot.relative.PRO$gene_end) + 2e6),
+                     breaks = seq(from = 0, to = max(gene.deldup.tmm.plot.relative.PRO$gene_end), by = 20000000),
+                     labels = c("0", "20,000,000", "40,000,000", "60,000,000", "80,000,000", "100,000,000", "120,000,000", "140,000,000")) +
+  expand_limits(x = 0, y = -1.5) +
   theme_classic() +
   coord_cartesian(clip = "off") +
   theme(
@@ -445,10 +453,10 @@ mean_values
 #### Figure 5B
 ```{r Figure5B}
 # PRO vs REV
-plot_tmp1 <- contr.parents2$top_tags$table %>%
+plot_tmp1 <- contr.parents$top_tags$table %>%
   mutate(region = case_when(
-    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
-    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    gene_chr == "8" & gene_start >= 0 & gene_end < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_end < duplication_end ~ "duplication",
     TRUE ~ "other"
   )) %>%
   filter(FDR <= 0.05, abs(logFC) >= 1.0)
@@ -458,7 +466,7 @@ region_counts1 <- plot_tmp1 %>%
   summarise(count = n())
 
 # PRO vs Parents
-plot_tmp2 <- contr.parents$top_tags$table %>%
+plot_tmp2 <- contr.rev$top_tags$table %>%
   mutate(region = case_when(
     gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
     gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
@@ -569,7 +577,7 @@ chi_results
 genes <- c("DLGAP2", "CSMD1","RHOBTB2", "CHRNA2", "GATA4", "XKR6")
 plot.genelist <- c("MCPH1", "CLN8", "RHOBTB2", "UNC5D", "CNTN4", "NAV3")
 
-plot_tmp <- contr.parents2$top_tags$table %>%
+plot_tmp <- contr.rev$top_tags$table %>%
   dplyr::select(gene_name, logFC, logCPM, FDR, gene_start, gene_end, gene_chr, gene_biotype) %>%
   mutate(region = case_when(
     gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
@@ -599,21 +607,21 @@ for (id in pathways) {
         plot <- gseaplot2(GSEA_H, geneSetID = id)
         print(plot)
         print(id)
-        ggsave(filename = paste0("Enrichment_Plot_", id, "_H.png"), plot = plot, width = 4, height = 4, dpi = 300)
+        #ggsave(filename = paste0("Enrichment_Plot_", id, "_H.png"), plot = plot, width = 4, height = 4, dpi = 300)
         
     } else if (id %in% GSEA_C2@result$ID) {
         name <- GSEA_C2@result[id, "Description"]
         plot <- gseaplot2(GSEA_C2, geneSetID = id)
         print(plot)
         print(id)
-        ggsave(filename = paste0("Enrichment_Plot_", id, "_C2.png"), plot = plot, width = 4, height = 4, dpi = 300)
+        #ggsave(filename = paste0("Enrichment_Plot_", id, "_C2.png"), plot = plot, width = 4, height = 4, dpi = 300)
         
     } else if (id %in% GSEA_C5@result$ID) {
         name <- GSEA_C5@result[id, "Description"]
         plot <- gseaplot2(GSEA_C5, geneSetID = id) 
         print(plot)
         print(id)
-        ggsave(filename = paste0("Enrichment_Plot_", id, "_C5.png"), plot = plot, width = 4, height = 4, dpi = 300)
+        #ggsave(filename = paste0("Enrichment_Plot_", id, "_C5.png"), plot = plot, width = 4, height = 4, dpi = 300)
         
     } else {
         print(paste("Pathway", id, "not found in any GSEA results."))
@@ -624,29 +632,29 @@ for (id in pathways) {
 
 #### Supplementary Tables
 ```{r Supplementary Tables}
-DEgenes361 <- contr.parents2$top_tags$table %>%
+DEgenes361 <- contr.rev$top_tags$table %>%
   filter(FDR <= 0.05, abs(logFC) >= 1.0) %>%
   mutate(region = case_when(
     gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
     gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
     TRUE ~ "other"
   ))
-DEgenesAll <- contr.parents2$top_tags$table %>%
+DEgenesAll <- contr.rev$top_tags$table %>%
   filter(FDR <= 0.05) %>%
   mutate(region = case_when(
     gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
     gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
     TRUE ~ "other"
   ))
-write_csv(DEgenesAll, "DEgenesPROvsREV-all.csv")
+#write_csv(DEgenesAll, "DEgenesPROvsREV-all.csv")
 
-genesAll <- contr.parents2$top_tags$table %>%
+genesAll <- contr.rev$top_tags$table %>%
   mutate(region = case_when(
     gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
     gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
     TRUE ~ "other"
   ))
-write_csv(genesAll, "genesPROvsREV-all.csv")
+#write_csv(genesAll, "genesPROvsREV-all.csv")
 
 gsea_h_df <- as.data.frame(GSEA_H@result) %>%
   left_join(H_t2g %>%
@@ -672,7 +680,7 @@ GSEA_result_PRO_versus_REV <- bind_rows(gsea_h_df, gsea_c5_df, gsea_c2_df) %>%
 GSEA_table <- GSEA_result_PRO_versus_REV %>%
   dplyr::select(-c(Description, gs_description)) %>%
   dplyr::rename("MSigDB_gene_sets" = geneset)
-write_csv(GSEA_table, "gseaPROvsREV-all.csv")
+#write_csv(GSEA_table, "gseaPROvsREV-all.csv")
 ```
 
 ## Session Info and Citations

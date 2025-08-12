@@ -1,6 +1,7 @@
 ---
-title: "Chromosome engineering to restore euploidy in cells harboring a complex rearrangement of chromosome 8"
-subtitle: "Computational Analysis"
+title: "Chromosome engineering to correct a complex rearrangement on chromosome 8 reveals the effects of 
+8p syndrome on gene expression and neural differentiation"
+subtitle: "Computational Analysis for Figure 1-4 and Supplementary"
 author: "Lu Qiao"
 date: "`r Sys.Date()`"
 output:
@@ -35,6 +36,7 @@ library("org.Hs.eg.db")
 library("enrichplot")   
 library("msigdbr")
 library("biomaRt")
+library(MetBrewer)
 ```
 
 ## Analysis on Altered Region
@@ -106,14 +108,15 @@ if (length(overlapping_genes) > 0) {
 ## Differential Expression analysis
 ### prepare input data
 ```{r prepare input data}
-counts <- read.csv("gene_count.csv")
-samples <- read_xlsx("Sample List.xlsx")
+counts <- read.csv("data/gene_count.csv")
+samples <- read_xlsx("data/Sample List.xlsx")
 raw.counts <- counts %>% dplyr::select(gene_id, samples$`Sample Name`)
 annotation <- counts %>% dplyr::select(-all_of(samples$`Sample Name`))
 ```
 
 ### define functions
 ```{r functions}
+fc_threshold = 1.0
 get_results <- function(contrast, qlf, p_value = 0.05, n_top = Inf) {
   # identify significant DE genes
   is.de <- decideTests(qlf, p.value = p_value)
@@ -125,7 +128,7 @@ get_results <- function(contrast, qlf, p_value = 0.05, n_top = Inf) {
   
   # apply a threshold for DE genes
   thresholded_results <- top_tags$table[
-  top_tags$table$FDR <= 0.05 & abs(top_tags$table$logFC) >= 1.0, ]
+  top_tags$table$FDR <= 0.05 & abs(top_tags$table$logFC) >= fc_threshold, ]
   
   return(list(
     contrast = contrast,
@@ -156,10 +159,11 @@ plot_all_results <- function(results_list) {
               position = position_dodge(width = 0.9), 
               vjust = -0.5) +
     labs(title = "Differential Expression Across Comparisons",
+         subtitle = "padj <= 0.05",
          x = "Comparison",
          y = "Number of Genes") +
     theme_minimal() +
-    scale_fill_manual(values = c("Upregulated" = "green", "Downregulated" = "red", "No Change" = "gray"))
+    scale_fill_manual(values = c("Upregulated" = "lightblue", "Downregulated" = "pink", "No Change" = "gray"))
 
   print(plot)
 }
@@ -168,17 +172,17 @@ plot_thresholded_results <- function(results_list) {
   plot_data <- lapply(results_list, function(result) {
     thresholded_results <- result$thresholded_results
     # Count the number of upregulated genes (logFC >= 1.0)
-    upregulated_genes <- thresholded_results[thresholded_results$logFC >= 1.0 & thresholded_results$FDR <= 0.05, ]
+    upregulated_genes <- thresholded_results[thresholded_results$logFC >= fc_threshold & thresholded_results$FDR <= 0.05, ]
     num_upregulated <- nrow(upregulated_genes)
     # Count the number of downregulated genes (logFC <= -1.0)
-    downregulated_genes <- thresholded_results[thresholded_results$logFC <= -1.0 & thresholded_results$FDR <= 0.05, ]
+    downregulated_genes <- thresholded_results[thresholded_results$logFC <= -fc_threshold & thresholded_results$FDR <= 0.05, ]
     num_downregulated <- nrow(downregulated_genes)
     
     all <- num_downregulated + num_upregulated
    
     data.frame(
-      Category = c("Upregulated", "Downregulated", "ALL"),
-      Count = c(num_upregulated, num_downregulated, all),
+      Category = c("Upregulated", "Downregulated"),
+      Count = c(num_upregulated, num_downregulated),
       Comparison = result$contrast
     )
   })
@@ -189,154 +193,17 @@ plot_thresholded_results <- function(results_list) {
     geom_text(aes(label = Count), 
               position = position_dodge(width = 0.9), 
               vjust = -0.5) +  # Adds numbers on top of bars
-    labs(title = "Differential Expression Across Comparisons (padj <= 0.05 or |logFC| >= 1.0) ",
+    labs(title = "Differential Expression Across Comparisons",
+         subtitle = "padj <= 0.05 and |logFC| >= 1",
          x = "Comparison",
          y = "Number of Genes") +
     theme_minimal() +
-    scale_fill_manual(values = c("Upregulated" = "green", "Downregulated" = "red", "ALL" = "gray"))
+    scale_fill_manual(values = c("Upregulated" = "skyblue", "Downregulated" = "maroon"))
   
   print(plot)
   return(plot_data)
 }
-```
 
-### analysis
-```{r, DE analysis - PRO vs Parents, PRO vs REV}
-samples.parents <- samples %>%
-  mutate(`Group Name` = ifelse(`Group Name` %in% c("MOM", "DAD"), "Parents", `Group Name`))
-print(samples.parents)
-
-y.parents <- DGEList(counts = raw.counts, samples = samples.parents, group = samples.parents$`Group Name`)
-y.parents$genes <- annotation
-keep <- filterByExpr(y.parents, min.count = 30, min.total.count = 50, large.n = 10, min.prop = 0.75) # filter lowly expressed transcripts
-table(keep)
-y.parents <- y.parents[keep, , keep.lib.sizes=FALSE]
-y.parents <- normLibSizes(y.parents) # TMM normalization
-# calculate CPM 
-log2_cpm <- cpm(y.parents, log = TRUE, prior.count = 1, normalized.lib.sizes = T)
-cpm_counts<-cpm(y.parents, normalized.lib.sizes = T) 
-tmm_data_with_annotations <- cbind(y.parents$genes, cpm_counts)
-log2_tmm_data_with_annotations <- cbind(y.parents$genes, log2_cpm)
-
-colnames(log2_cpm) <- samples$`Cell line`
-gene_annotations <- data.frame(GeneID = y.parents$genes$gene_id, Description = y.parents$genes$gene_description)
-gsea.input <- cbind(gene_annotations, log2_cpm)
-write.table(gsea.input, file="log2_TMM_normalized_counts.txt", 
-            sep="\t", quote=FALSE, row.names=FALSE)
-colnames(cpm_counts) <- samples$`Cell line`
-gene_annotations <- data.frame(GeneID = y.parents$genes$gene_id, Description = y.parents$genes$gene_description)
-gsea.input <- cbind(gene_annotations, cpm_counts)
-write.table(gsea.input, file="TMM_normalized_counts.txt", 
-            sep="\t", quote=FALSE, row.names=FALSE)
-
-# DE analysis
-plotMDS(y.parents)        
-samples.design.parents <- model.matrix(~ 0 + group,data = y.parents$samples) # design
-colnames(samples.design.parents) <- gsub("group", "", colnames(samples.design.parents))
-y.parents <- estimateDisp(y.parents, samples.design.parents, robust=TRUE)
-print(y.parents$common.dispersion)
-plotBCV(y.parents)
-
-fit.parents <- glmQLFit(y.parents, samples.design.parents, robust=TRUE)
-plotQLDisp(fit.parents)
-
-# make contrast
-parent.contrast <- makeContrasts(PROvsParents=PRO-Parents, levels=samples.design.parents)
-rev.contrast <- makeContrasts(PROvsREV=PRO-REV, levels=samples.design.parents)
-
-qlf.PROvsParents <- glmQLFTest(fit.parents, contrast=parent.contrast[,"PROvsParents"])
-qlf.PROvsREV <- glmQLFTest(fit.parents, contrast=rev.contrast[,"PROvsREV"])
-
-contr.parents <- get_results("PRO - Parents", qlf.PROvsParents)
-contr.rev <- get_results("PRO - REV", qlf.PROvsREV)
-
-parents_results_list <- list(contr.parents, contr.rev)
-plot_all_results(parents_results_list)
-table.results <- plot_thresholded_results(parents_results_list)
-```
-
-## GSEA
-### import data
-```{r GSEA - import input}
-ranked_data_PRO_versus_REV <- read.table("ranked_gene_list_PRO_versus_REV_1728681059442.tsv", 
-                          header = TRUE, 
-                          sep = "\t", 
-                          quote = "",
-                          fill = TRUE,
-                          comment.char = "")
-
-# import gene set
-H_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>% 
-  dplyr::select(gs_name, entrez_gene, gs_description)
-C5_t2g <- msigdbr(species = "Homo sapiens", category = "C5") %>% 
-  dplyr::select(gs_name, entrez_gene, gs_description)
-C2_t2g <- msigdbr(species = "Homo sapiens", category = "C2") %>% 
-  dplyr::select(gs_name, entrez_gene, gs_description)
-```
-
-### analysis
-```{r GSEA PRO_versus_REV}
-pvalue_cutoff <- 0.05
-n_permutations <- 100000
-ranked_genes <- setNames(ranked_data_PRO_versus_REV$SCORE, ranked_data_PRO_versus_REV$NAME)
-# Map to Entrez IDs
-entrez_ids <- mapIds(org.Hs.eg.db, 
-                     keys = names(ranked_genes), 
-                     column = "ENTREZID", 
-                     keytype = "SYMBOL", 
-                     multiVals = "first")
-  
-# Remove unmapped genes 
-ranked_genes_entrez <- ranked_genes[!is.na(entrez_ids)]
-names(ranked_genes_entrez) <- entrez_ids[!is.na(entrez_ids)]
-  
-# Resolve ties by adding a small random number
-ranked_genes_entrez <- ranked_genes_entrez + runif(length(ranked_genes_entrez), min = -1e-5, max = 1e-5)
-
-ranked_genes_entrez <- sort(ranked_genes_entrez, decreasing = TRUE)
-
-GSEA_H <- GSEA(geneList = ranked_genes_entrez,
-                    TERM2GENE = H_t2g,       
-                    pvalueCutoff = pvalue_cutoff,   
-                    eps = 0,                     
-                    nPermSimple = n_permutations, 
-                    minGSSize = 15,                 
-                    maxGSSize = 500,              
-                    verbose = TRUE)
-GSEA_C5 <- GSEA(geneList = ranked_genes_entrez, 
-                    TERM2GENE = C5_t2g,         
-                    pvalueCutoff = pvalue_cutoff,   
-                    eps = 0,                        
-                    nPermSimple = n_permutations,   
-                    minGSSize = 15,                  
-                    maxGSSize = 500,              
-                    verbose = TRUE)
-GSEA_C2 <- GSEA(geneList = ranked_genes_entrez,  
-                    TERM2GENE = C2_t2g,          
-                    pvalueCutoff = pvalue_cutoff,   
-                    eps = 0,                         
-                    nPermSimple = n_permutations,   
-                    minGSSize = 15,                
-                    maxGSSize = 500,              
-                    verbose = TRUE)
-
-```
-## Manuscript Figures
-### Figure 5
-```{r Constants for Plots}
-sample_to_group <- samples %>%
-  dplyr::select(`Sample Name`, `Group Name`)
-
-library(MetBrewer)
-library(ggthemes)
-library(grid)
-annotation_colors <- met.brewer("Cassatt1", n = 8, type = "discrete")  # Select red and blue shades
-del_shade <- annotation_colors[5]
-dup_shade <- annotation_colors[4]
-centr_shade <- annotation_colors[8]
-```
-#### Figure 5A
-```{r Figure 5A}
 custom_rollmean <- function(x, k = 40) {
   n <- length(x)
   half_window <- k / 2
@@ -360,7 +227,156 @@ custom_rollmean <- function(x, k = 40) {
   
   return(rolling_avg)
 }
+```
 
+### analysis
+```{r, DE analysis - PRO vs Parents, PRO vs REV}
+samples.parents <- samples %>%
+  mutate(`Group Name` = ifelse(`Group Name` %in% c("MOM", "DAD"), "Parents", `Group Name`))
+print(samples.parents)
+
+y.parents <- DGEList(counts = raw.counts, samples = samples.parents, group = samples.parents$`Group Name`)
+y.parents$genes <- annotation
+
+keep <- filterByExpr(y.parents, min.count = 30, min.total.count = 50, large.n = 10, min.prop = 0.75) # filter lowly expressed transcripts
+table(keep)
+y.parents <- y.parents[keep, , keep.lib.sizes=FALSE]
+y.parents <- normLibSizes(y.parents) # TMM normalization
+# calculate CPM 
+log2_cpm <- cpm(y.parents, log = TRUE, prior.count = 1, normalized.lib.sizes = T)
+cpm_counts<-cpm(y.parents, normalized.lib.sizes = T)
+tmm_data_with_annotations <- cbind(y.parents$genes, cpm_counts)
+log2_tmm_data_with_annotations <- cbind(y.parents$genes, log2_cpm)
+
+colnames(log2_cpm) <- samples$`Cell line`
+gene_annotations <- data.frame(GeneID = y.parents$genes$gene_id, Description = y.parents$genes$gene_description)
+gsea.input <- cbind(gene_annotations, log2_cpm)
+# write.table(gsea.input, file="log2_TMM_normalized_counts.txt", 
+#             sep="\t", quote=FALSE, row.names=FALSE)
+colnames(cpm_counts) <- samples$`Cell line`
+gene_annotations <- data.frame(GeneID = y.parents$genes$gene_id, Description = y.parents$genes$gene_description)
+gsea.input <- cbind(gene_annotations, cpm_counts)
+# write.table(gsea.input, file="TMM_normalized_counts.txt", 
+#             sep="\t", quote=FALSE, row.names=FALSE)
+
+# DE analysis
+plotMDS(y.parents)        
+samples.design.parents <- model.matrix(~ 0 + group,data = y.parents$samples) # design
+colnames(samples.design.parents) <- gsub("group", "", colnames(samples.design.parents))
+y.parents <- estimateDisp(y.parents, samples.design.parents, robust=TRUE)
+print(y.parents$common.dispersion)
+plotBCV(y.parents)
+
+fit.parents <- glmQLFit(y.parents, samples.design.parents, robust=TRUE)
+plotQLDisp(fit.parents)
+
+# make contrast
+parent.contrast <- makeContrasts(PROvsParents=PRO-Parents, levels=samples.design.parents)
+rev.contrast <- makeContrasts(PROvsREV=PRO-REV, levels=samples.design.parents)
+parent.rev.contrast <- makeContrasts(ParentsvsREV=Parents-REV, levels=samples.design.parents)
+
+qlf.PROvsParents <- glmQLFTest(fit.parents, contrast=parent.contrast[,"PROvsParents"])
+qlf.PROvsREV <- glmQLFTest(fit.parents, contrast=rev.contrast[,"PROvsREV"])
+qlf.ParentsvsREV <- glmQLFTest(fit.parents, contrast=parent.rev.contrast[,"ParentsvsREV"])
+
+contr.parents <- get_results("PRO - Parents", qlf.PROvsParents)
+contr.rev <- get_results("PRO - REV", qlf.PROvsREV)
+contr.parent.rev <- get_results("Parents - REV", qlf.ParentsvsREV)
+
+parents_results_list <- list(contr.parents, contr.rev,contr.parent.rev)
+plot_all_results(parents_results_list)
+table.results <- plot_thresholded_results(parents_results_list)
+```
+
+```{r}
+# write_csv(contr.rev$top_tags$table, "PROvsREV_DE_results.csv")
+
+```
+
+## GSEA
+### import data
+```{r GSEA - import input}
+ranked_data_PRO_versus_REV <- read.table("data/ranked_gene_list_PRO_versus_REV_1728681059442.tsv", 
+                          header = TRUE, 
+                          sep = "\t", 
+                          quote = "",
+                          fill = TRUE,
+                          comment.char = "")
+
+# import gene set
+H_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>% dplyr::select(gs_name, entrez_gene, gs_description)
+C5_t2g <- msigdbr(species = "Homo sapiens", category = "C5") %>% dplyr::select(gs_name, entrez_gene, gs_description)
+C2_t2g <- msigdbr(species = "Homo sapiens", category = "C2") %>% dplyr::select(gs_name, entrez_gene, gs_description)
+```
+
+### analysis
+```{r GSEA PRO_versus_REV}
+pvalue_cutoff <- 0.05
+n_permutations <- 100000
+ranked_genes <- setNames(ranked_data_PRO_versus_REV$SCORE, ranked_data_PRO_versus_REV$NAME)
+# Map to Entrez IDs
+entrez_ids <- mapIds(org.Hs.eg.db, 
+                     keys = names(ranked_genes), 
+                     column = "ENTREZID", 
+                     keytype = "SYMBOL", 
+                     multiVals = "first")
+
+# Remove unmapped genes 
+ranked_genes_entrez <- ranked_genes[!is.na(entrez_ids)]
+names(ranked_genes_entrez) <- entrez_ids[!is.na(entrez_ids)]
+  
+# Resolve ties by adding a small random number
+ranked_genes_entrez <- ranked_genes_entrez + runif(length(ranked_genes_entrez), min = -1e-5, max = 1e-5)
+
+ranked_genes_entrez <- sort(ranked_genes_entrez, decreasing = TRUE)
+head(ranked_genes_entrez)
+
+set.seed(1234)
+GSEA_H <- GSEA(geneList = ranked_genes_entrez,
+                    TERM2GENE = H_t2g,       
+                    pvalueCutoff = 1.0,   
+                    eps = 0,                     
+                    nPermSimple = n_permutations, 
+                    minGSSize = 15,                 
+                    maxGSSize = 500,              
+                    verbose = TRUE)
+
+GSEA_C5 <- GSEA(geneList = ranked_genes_entrez,
+                    TERM2GENE = C5_t2g,
+                    pvalueCutoff = 1.0,
+                    eps = 0,
+                    nPermSimple = n_permutations,
+                    minGSSize = 15,
+                    maxGSSize = 500,
+                    verbose = TRUE)
+
+GSEA_C2 <- GSEA(geneList = ranked_genes_entrez,  
+                    TERM2GENE = C2_t2g,          
+                    pvalueCutoff = 1.0,   
+                    eps = 0,                         
+                    nPermSimple = n_permutations,   
+                    minGSSize = 15,                
+                    maxGSSize = 500,              
+                    verbose = TRUE)
+```
+
+
+## Manuscript Figures
+### Figure 4
+```{r Constants for Plots}
+sample_to_group <- samples %>%
+  dplyr::select(`Sample Name`, `Group Name`)
+
+library(MetBrewer)
+library(ggthemes)
+library(grid)
+annotation_colors <- met.brewer("Cassatt1", n = 8, type = "discrete")  # Select red and blue shades
+del_shade <- annotation_colors[5]
+dup_shade <- annotation_colors[4]
+centr_shade <- annotation_colors[8]
+```
+#### Figure 4A
+```{r Figure 4A}
 gene.deldup.tmm <- log2_tmm_data_with_annotations %>%
   filter(gene_chr == "8") %>%
   dplyr::select(gene_id, gene_start, gene_end, samples$`Sample Name`) %>%
@@ -430,15 +446,15 @@ plot_object <- ggplot(gene.deldup.tmm.plot.relative.PRO, aes(x = (gene_start+gen
   ) 
 
 print(plot_object)
-
-ggsave(
-  filename = "gene_expression_plot_log2_PROvsREV.png",
-  plot = plot_object,
-  width = 18,   # Adjust the width to make the canvas longer
-  height = 6,   # Adjust the height to control the aspect ratio
-  dpi = 300,     # Set the resolution to 300 dpi
-  bg = "transparent"
-)
+# 
+# ggsave(
+#   filename = "gene_expression_plot_log2_PROvsREV.png",
+#   plot = plot_object,
+#   width = 18,   # Adjust the width to make the canvas longer
+#   height = 6,   # Adjust the height to control the aspect ratio
+#   dpi = 300,     # Set the resolution to 300 dpi
+#   bg = "transparent"
+# )
 
 # calculate mean expression
 mean_values <- gene.deldup.tmm.plot.relative.PRO %>%
@@ -450,10 +466,10 @@ mean_values <- gene.deldup.tmm.plot.relative.PRO %>%
 mean_values
 ```
 
-#### Figure 5B
-```{r Figure5B}
+#### Figure 4B
+```{r Figure4B}
 # PRO vs REV
-plot_tmp1 <- contr.parents$top_tags$table %>%
+plot_tmp1 <- contr.rev$top_tags$table %>%
   mutate(region = case_when(
     gene_chr == "8" & gene_start >= 0 & gene_end < deletion_end ~ "deletion",
     gene_chr == "8" & gene_start >= duplication_start & gene_end < duplication_end ~ "duplication",
@@ -466,7 +482,7 @@ region_counts1 <- plot_tmp1 %>%
   summarise(count = n())
 
 # PRO vs Parents
-plot_tmp2 <- contr.rev$top_tags$table %>%
+plot_tmp2 <- contr.parents$top_tags$table %>%
   mutate(region = case_when(
     gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
     gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
@@ -486,16 +502,16 @@ long_counts <- combined_counts %>%
   pivot_longer(cols = starts_with("count"), names_to = "dataset", values_to = "count")
 
 
-# Plot the counts side-by-side
-ggplot(long_counts, aes(x = region, y = count, fill = dataset)) +
-  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
-  labs(title = "Region Counts - PRO vs Parents", x = "Region", y = "Count") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  scale_fill_brewer(palette = "Set2") +
-  scale_y_log10() +
-  geom_text(aes(label = round(count, 2)), 
-            position = position_dodge(width = 0.8), vjust = -0.5, size = 3)
+# # Plot the counts side-by-side
+# ggplot(long_counts, aes(x = region, y = count, fill = dataset)) +
+#   geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+#   labs(title = "Region Counts - PRO vs Parents", x = "Region", y = "Count") +
+#   theme_minimal() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#   scale_fill_brewer(palette = "Set2") +
+#   scale_y_log10() +
+#   geom_text(aes(label = round(count, 2)), 
+#             position = position_dodge(width = 0.8), vjust = -0.5, size = 3)
 
 # Chi-square
 region <- log2_tmm_data_with_annotations %>%
@@ -569,11 +585,70 @@ other_result <- chisq.test(contingency.other, correct = FALSE) %>%
 
 chi_results <- bind_rows(del_result, dup_result, other_result) %>%
   mutate(label = paste0("p = ", round(p.value, digits = 3)))
-chi_results
-```
 
-#### Figure 5C
-```{r Figure5C}
+
+chi_results
+
+p.adjust(chi_results$p.value)
+```
+```{r Figure4B updated}
+# Parents vs REV
+plot_tmp3 <- contr.parent.rev$top_tags$table %>%
+  mutate(region = case_when(
+    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+    TRUE ~ "other"
+  )) %>%
+  filter(FDR <= 0.05, abs(logFC) >= 1.0)
+
+region_counts3 <- plot_tmp3 %>%
+  group_by(region) %>%
+  summarise(count = n())
+
+
+combined_counts_3 <- region_counts1 %>%
+  left_join(region_counts2, by = "region", suffix = c(".PROvsREV", ".PROvsParents")) %>%
+  left_join(region_counts3, by = "region") %>%
+  dplyr::rename(count.ParentsvsREV = count)
+
+long_counts <- combined_counts_3 %>%
+  pivot_longer(cols = starts_with("count"), names_to = "dataset", values_to = "count")
+
+
+# Plot the counts side-by-side
+ggplot(long_counts, aes(x = region, y = count, fill = dataset)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  labs(title = "Region Counts", x = "Region", y = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_log10() +
+  geom_text(aes(label = round(count, 2)), 
+            position = position_dodge(width = 0.9), vjust = -0.5, size = 3)
+
+# overlap between PROVREV and ParentsREV
+merged <- inner_join(plot_tmp3, plot_tmp1, by = "gene_id", suffix = c(".ParentsREV", ".PROREV"))
+
+# Filter for same direction of logFC
+same_direction <- merged %>%
+  filter((logFC.ParentsREV > 0 & logFC.PROREV > 0) | (logFC.ParentsREV < 0 & logFC.PROREV < 0))
+
+# Count total
+n_total <- nrow(same_direction)
+
+# Count by region
+n_other       <- same_direction %>% filter(region.ParentsREV == "other" & region.PROREV == "other") %>% nrow()
+n_deletion    <- same_direction %>% filter(region.ParentsREV == "deletion" & region.PROREV == "deletion") %>% nrow()
+n_duplication <- same_direction %>% filter(region.ParentsREV == "duplication" & region.PROREV == "duplication") %>% nrow()
+
+# Print counts
+cat("Total same-direction intersect:", n_total, "\n",
+    "Other region:", n_other, "\n",
+    "Deletion region:", n_deletion, "\n",
+    "Duplication region:", n_duplication, "\n")
+```
+#### Figure 4C
+```{r Figure4C}
 genes <- c("DLGAP2", "CSMD1","RHOBTB2", "CHRNA2", "GATA4", "XKR6")
 plot.genelist <- c("MCPH1", "CLN8", "RHOBTB2", "UNC5D", "CNTN4", "NAV3")
 
@@ -597,8 +672,8 @@ ggplot(plot_tmp, aes(x = gene_name, y = logFC, fill = region)) +
   theme(axis.text.x = element_text(angle = 90, hjust = 1))
 ```
 
-#### Figure 5D
-```{r Figure5D}
+#### Figure 4E
+```{r Figure4E}
 pathways <- c("REACTOME_DNA_METHYLATION", "REACTOME_ACTIVATION_OF_ANTERIOR_HOX_GENES_IN_HINDBRAIN_DEVELOPMENT_DURING_EARLY_EMBRYOGENESIS", "REACTOME_SEMA4D_INDUCED_CELL_MIGRATION_AND_GROWTH_CONE_COLLAPSE", "REACTOME_TRANSLATION")
 
 for (id in pathways) {
@@ -614,15 +689,15 @@ for (id in pathways) {
         plot <- gseaplot2(GSEA_C2, geneSetID = id)
         print(plot)
         print(id)
-        #ggsave(filename = paste0("Enrichment_Plot_", id, "_C2.png"), plot = plot, width = 4, height = 4, dpi = 300)
+        # ggsave(filename = paste0("Enrichment_Plot_", id, "_C2.png"), plot = plot, width = 4, height = 4, dpi = 300)
         
     } else if (id %in% GSEA_C5@result$ID) {
         name <- GSEA_C5@result[id, "Description"]
-        plot <- gseaplot2(GSEA_C5, geneSetID = id) 
+        plot <- gseaplot2(GSEA_C5, geneSetID = id)
         print(plot)
         print(id)
         #ggsave(filename = paste0("Enrichment_Plot_", id, "_C5.png"), plot = plot, width = 4, height = 4, dpi = 300)
-        
+
     } else {
         print(paste("Pathway", id, "not found in any GSEA results."))
     }
@@ -631,7 +706,7 @@ for (id in pathways) {
 ```
 
 #### Supplementary Tables
-```{r Supplementary Tables}
+```{r Supplementary Table S1}
 DEgenes361 <- contr.rev$top_tags$table %>%
   filter(FDR <= 0.05, abs(logFC) >= 1.0) %>%
   mutate(region = case_when(
@@ -648,14 +723,18 @@ DEgenesAll <- contr.rev$top_tags$table %>%
   ))
 #write_csv(DEgenesAll, "DEgenesPROvsREV-all.csv")
 
-genesAll <- contr.rev$top_tags$table %>%
-  mutate(region = case_when(
-    gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
-    gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
-    TRUE ~ "other"
-  ))
+# genesAll <- contr.rev$top_tags$table %>%
+#   mutate(region = case_when(
+#     gene_chr == "8" & gene_start >= 0 & gene_start < deletion_end ~ "deletion",
+#     gene_chr == "8" & gene_start >= duplication_start & gene_start < duplication_end ~ "duplication",
+#     TRUE ~ "other"
+#   ))
 #write_csv(genesAll, "genesPROvsREV-all.csv")
+```
 
+
+```{r Table S2}
+# Table S2
 gsea_h_df <- as.data.frame(GSEA_H@result) %>%
   left_join(H_t2g %>%
               dplyr::select(gs_name, gs_description) %>%
@@ -665,7 +744,7 @@ gsea_h_df <- as.data.frame(GSEA_H@result) %>%
 gsea_c5_df <- as.data.frame(GSEA_C5@result) %>%
   left_join(C5_t2g%>%
               dplyr::select(gs_name, gs_description) %>%
-              distinct(), 
+              distinct(),
             by = c("ID" = "gs_name")) %>%
   mutate(geneset = "C5")
 gsea_c2_df <- as.data.frame(GSEA_C2@result) %>%
@@ -674,13 +753,13 @@ gsea_c2_df <- as.data.frame(GSEA_C2@result) %>%
               distinct(), 
             by = c("ID" = "gs_name")) %>%
   mutate(geneset = "C2")
-GSEA_result_PRO_versus_REV <- bind_rows(gsea_h_df, gsea_c5_df, gsea_c2_df) %>%
+GSEA_result_PRO_versus_REV <- bind_rows(gsea_h_df, gsea_c2_df, gsea_c5_df) %>%
   arrange(enrichmentScore)
 
 GSEA_table <- GSEA_result_PRO_versus_REV %>%
   dplyr::select(-c(Description, gs_description)) %>%
   dplyr::rename("MSigDB_gene_sets" = geneset)
-#write_csv(GSEA_table, "gseaPROvsREV-all.csv")
+# write_csv(GSEA_table, "gseaPROvsREV.csv")
 ```
 
 ## Session Info and Citations

@@ -1,0 +1,327 @@
+---
+title: "Chromosome engineering to correct a complex rearrangement on chromosome 8 reveals the effects of 
+8p syndrome on gene expression and neural differentiation"
+subtitle: "Computational Analysis for Supplementary S3DE"
+author: "Lu Qiao"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  autodep = TRUE,
+  cache.lazy = FALSE,
+  fig.width = 10,
+  fig.height = 7.75,
+  message = FALSE
+)
+```
+
+
+### Load Libraries
+```{r load library, message=FALSE, warning=FALSE}
+library("readxl")
+library("tidyverse") 
+library("edgeR")        
+library("clusterProfiler")
+library("org.Hs.eg.db") 
+library("enrichplot")   
+library("msigdbr")
+library("biomaRt")
+library(MetBrewer)
+```
+
+
+## GSEA
+### exclude 8p region
+```{r}
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+# region of interest
+chromosome_of_interest <- "8"
+deletion_start <- 0
+deletion_end <- 7247573
+duplication_start <- 11828865
+duplication_end <- 40361770
+
+attributes <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "chromosome_name",
+  "start_position",
+  "end_position",
+  "strand",
+  "gene_biotype"
+)
+
+# deletion region
+filters_del <- c("chromosome_name", "start", "end")
+values_del <- list(chromosome_of_interest, deletion_start, deletion_end)
+
+genes_in_deletion <- getBM(
+  attributes = attributes,
+  filters = filters_del,
+  values = values_del,
+  mart = ensembl
+)
+
+# duplication region
+filters_dup <- c("chromosome_name", "start", "end")
+values_dup <- list(chromosome_of_interest, duplication_start, duplication_end)
+
+genes_in_duplication <- getBM(
+  attributes = attributes,
+  filters = filters_dup,
+  values = values_dup,
+  mart = ensembl
+)
+
+# Load Hallmark gene sets
+H_t2g <- msigdbr(species = "Homo sapiens", category = "H") 
+C5_t2g <- msigdbr(species = "Homo sapiens", category = "C5") 
+C2_t2g <- msigdbr(species = "Homo sapiens", category = "C2")
+
+
+genes_to_exclude <- unique(c(genes_in_duplication$ensembl_gene_id, genes_in_deletion$ensembl_gene_id))
+
+H_t2g_filtered <- H_t2g[!H_t2g$ensembl_gene %in% genes_to_exclude, ] %>% dplyr::select(gs_name, entrez_gene, gs_description)
+
+C5_filtered <- C5_t2g[!C5_t2g$ensembl_gene %in% genes_to_exclude, ] %>% dplyr::select(gs_name, entrez_gene, gs_description)
+
+C2_filtered <- C2_t2g[!C2_t2g$ensembl_gene %in% genes_to_exclude, ] %>% dplyr::select(gs_name, entrez_gene, gs_description)
+
+
+# length(unique(C2_t2g$gs_name))
+# length(unique(C2_filtered$gs_name))
+# length(unique(H_t2g$gs_name))
+# length(unique(H_t2g_filtered$gs_name))
+
+ranked_data_PRO_versus_REV <- read.table("filtered_ranked_gene_list_PRO_versus_REV_1743794460069.tsv", 
+                          header = TRUE, 
+                          sep = "\t", 
+                          quote = "",
+                          fill = TRUE,
+                          comment.char = "")
+
+```
+
+```{r}
+pvalue_cutoff <- 0.05
+n_permutations <- 100000
+ranked_genes <- setNames(ranked_data_PRO_versus_REV$SCORE, ranked_data_PRO_versus_REV$NAME)
+# Map to Entrez IDs
+entrez_ids <- mapIds(org.Hs.eg.db, 
+                     keys = names(ranked_genes), 
+                     column = "ENTREZID", 
+                     keytype = "SYMBOL", 
+                     multiVals = "first")
+  
+# Remove unmapped genes 
+ranked_genes_entrez <- ranked_genes[!is.na(entrez_ids)]
+names(ranked_genes_entrez) <- entrez_ids[!is.na(entrez_ids)]
+  
+# Resolve ties by adding a small random number
+ranked_genes_entrez <- ranked_genes_entrez + runif(length(ranked_genes_entrez), min = -1e-5, max = 1e-5)
+
+ranked_genes_entrez <- sort(ranked_genes_entrez, decreasing = TRUE)
+cat("Mapped", sum(!is.na(entrez_ids)), "out of", length(entrez_ids), "genes to Entrez IDs.\n")
+
+```
+
+```{r}
+set.seed(1234)
+GSEA_H <- GSEA(geneList = ranked_genes_entrez,
+                    TERM2GENE = H_t2g_filtered,
+                    pvalueCutoff = 1.0,
+                    eps = 0,
+                    nPermSimple = n_permutations,
+                    minGSSize = 15,
+                    maxGSSize = 500,
+                    verbose = TRUE)
+
+gsea_h_df <- as.data.frame(GSEA_H@result) %>%
+  left_join(H_t2g_filtered %>%
+              dplyr::select(gs_name, gs_description) %>%
+              distinct(),
+            by = c("ID" = "gs_name")) %>%
+  mutate(geneset = "Hallmark")
+
+GSEA_C5 <- GSEA(geneList = ranked_genes_entrez,
+                    TERM2GENE = C5_filtered,
+                    pvalueCutoff = 1.0,
+                    eps = 0,
+                    nPermSimple = n_permutations,
+                    minGSSize = 15,
+                    maxGSSize = 500,
+                    verbose = TRUE)
+GSEA_C2 <- GSEA(geneList = ranked_genes_entrez,
+                    TERM2GENE = C2_filtered,
+                    pvalueCutoff = 1.0,
+                    eps = 0,
+                    nPermSimple = n_permutations,
+                    minGSSize = 15,
+                    maxGSSize = 500,
+                    verbose = TRUE)
+
+gsea_c5_df <- as.data.frame(GSEA_C5@result) %>%
+  left_join(C5_t2g%>%
+              dplyr::select(gs_name, gs_description) %>%
+              distinct(),
+            by = c("ID" = "gs_name")) %>%
+  mutate(geneset = "C5")
+gsea_c2_df <- as.data.frame(GSEA_C2@result) %>%
+  left_join(C2_filtered %>%
+              dplyr::select(gs_name, gs_description) %>%
+              distinct(),
+            by = c("ID" = "gs_name")) %>%
+  mutate(geneset = "C2")
+GSEA_result_PRO_versus_REV <- bind_rows(gsea_h_df, gsea_c2_df, gsea_c5_df) %>%
+  arrange(enrichmentScore)
+
+GSEA_table <- GSEA_result_PRO_versus_REV %>%
+  dplyr::select(-c(Description, gs_description)) %>%
+  dplyr::rename("MSigDB_gene_sets" = geneset)
+
+# write_csv(GSEA_table, "gseaPROvsREV-wo8p-1234-noCutoff.csv")
+```
+
+```{r Supplementary Figure S3D}
+GSEA_table <- read_csv("gseaPROvsREV-wo8p-1234-noCutoff.csv")
+GSEA_table_all <- read_csv("gseaPROvsREV-1234-noCutoff.csv")
+
+# Join and compare NES direction
+compare_df <- inner_join(GSEA_table_all, GSEA_table, by = "ID", suffix = c("_all", "_filtered"))
+
+# Filter to only consistent NES direction
+consistent_df <- compare_df %>%
+  filter(sign(NES_all) == sign(NES_filtered))
+
+# Check how many remain
+n_consistent <- nrow(consistent_df)
+
+# Optional: list of consistent shared pathways
+consistent_pathways <- consistent_df$ID
+
+# Output
+cat("Number of consistent pathways:", n_consistent, "\n")
+
+all(sign(consistent_df$NES_all) == sign(consistent_df$NES_filtered))
+
+fdr_mismatch <- consistent_df %>%
+  filter((qvalue_all <= 0.05 & qvalue_filtered > 0.05) |
+         (qvalue_all > 0.05 & qvalue_filtered <= 0.05))
+
+cat("Number of shared pathways with FDR ≤ 0.05 in one table but not the other:", nrow(fdr_mismatch), "\n")
+
+opposite_nes <- compare_df %>%
+  filter(sign(NES_all) != sign(NES_filtered))
+
+cat("Number of shared pathways with opposite NES direction:", nrow(opposite_nes), "\n")
+
+# library(ggrepel)
+# 
+# more_sig_all <- compare_df %>% filter(qvalue_all < qvalue_filtered, sign(NES_all) == sign(NES_filtered), NES_all != 0, NES_filtered != 0)
+# ggplot(compare_df, aes(x = qvalue_all, y = qvalue_filtered, label = ID)) +
+#   geom_point(size = 1, color = "grey") +
+#   geom_text_repel(
+#     data = compare_df %>% filter(qvalue_all < qvalue_filtered, sign(NES_all) == sign(NES_filtered)), 
+#     aes(label = ID),
+#     size = 3,
+#     max.overlaps = 5,
+#     box.padding = 0.3,
+#     point.padding = 0.3,
+#     segment.color = "grey50"
+#   ) +
+#   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "lightblue") +
+#   theme_minimal() +
+#   labs(
+#     title = "Q value Comparison", x = "Q in GSEA_All", y = "Q in GSEA_background"
+#   ) +
+#   theme(
+#     text = element_text(family = "Arial", face = "bold"),
+#     plot.title = element_text(size = 20, face = "bold", hjust = 0.5, family = "Arial"),
+#     axis.title = element_text(size = 12, family = "Arial"),                
+#     axis.text = element_text(size = 12, family = "Arial"),
+#     axis.title.x = element_text(margin = margin(t = 20))
+#   )
+
+ggplot(consistent_df, aes(x = qvalue_all, y = qvalue_filtered)) +
+  geom_point(size = 1, color = "darkgrey") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "lightblue") +
+  theme_classic() +
+  labs(
+    title = "GSEA with/without 8p", x = "Q value (with 8p)", y = "Q value (without 8p)"
+  ) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme(
+    text = element_text(family = "Arial", face = "bold"),
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5, family = "Arial"),
+    axis.title = element_text(size = 18, family = "Arial"),                
+    axis.text = element_text(size = 18, family = "Arial"),
+    axis.title.x = element_text(margin = margin(t = 20))
+  )
+
+# Spearman
+spearman_r <- cor(consistent_df$qvalue_all,
+                  consistent_df$qvalue_filtered,
+                  use    = "complete.obs",
+                  method = "spearman")
+spearman_r
+
+spearman_test <- cor.test(consistent_df$qvalue_all,
+                  consistent_df$qvalue_filtered,
+                          use    = "complete.obs",
+                          method = "spearman")
+spearman_test
+
+# write_csv(consistent_df %>% dplyr::select(ID, qvalue_all, qvalue_filtered), "GSEA_comparison.csv")
+```
+```{r Supplementary Figure S3E}
+library(eulerr)
+
+consistent_df_sig <- compare_df %>%
+  filter(sign(NES_all) == sign(NES_filtered)) %>%
+  filter(qvalue_all <= 0.05 & qvalue_filtered <= 0.05)
+  
+
+venn_data <- c(
+  "GSEA with 8p" = nrow(GSEA_table_all %>% filter(qvalue <= 0.05)) - nrow(consistent_df_sig),
+  "GSEA without 8p" = nrow(GSEA_table %>% filter(qvalue <= 0.05)) - nrow(consistent_df_sig),
+  "GSEA with 8p&GSEA without 8p" = nrow(consistent_df_sig)
+)
+
+venn_euler <- euler(venn_data)
+p <- plot(
+  venn_euler,
+  fills = c(
+    met.brewer("Cassatt2", n = 10)[4],
+    met.brewer("Cassatt2", n = 10)[6]
+  ),
+  labels = list(font = 1, cex = 0),
+  alpha = 0.7
+)
+
+png("euler_plot_GSEA_all.png", width = 1500, height = 1200, res = 300)
+grid::grid.newpage()
+# Draw the plot
+grid::grid.draw(p)
+# Close the file
+dev.off()
+```
+
+
+## Session Info and Citations
+```{r}
+sessionInfo()
+packages_in_use <- c( names( sessionInfo()$otherPkgs ) )
+the_citations_list <- lapply( X=packages_in_use, FUN=citation)
+the_citations_list
+```

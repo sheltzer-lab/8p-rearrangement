@@ -1,0 +1,1049 @@
+---
+title: "Chromosome engineering to correct a complex rearrangement on chromosome 8 reveals the effects of 
+8p syndrome on gene expression and neural differentiation"
+subtitle: "Computational Analysis for Figure 5 and Supplementary"
+author: "Lu Qiao"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  autodep = TRUE,
+  cache.lazy = FALSE,
+  fig.width = 10,
+  fig.height = 7.75,
+  message = FALSE
+)
+```
+
+
+### Load Libraries
+```{r load library, message=FALSE, warning=FALSE}
+library("readxl")
+library("tidyverse") 
+library("edgeR")        
+library("clusterProfiler")
+library("org.Hs.eg.db") 
+library("enrichplot")   
+library("msigdbr")
+library("biomaRt")
+library(grid)
+library(scales)
+library(ggrepel)
+library(gtsummary)
+library(gt)
+library(MetBrewer)
+library(eulerr)
+library(ggthemes)
+```
+
+## Differential Expression analysis
+### define functions
+```{r functions}
+fc_threshold = 1
+get_results <- function(contrast, qlf, p_value = 0.05, n_top = Inf) {
+  # identify significant DE genes
+  is.de <- decideTests(qlf, p.value = p_value)
+  summary_de <- summary(is.de)
+  top_tags <- topTags(qlf, n = n_top)
+  upregulated <- sum(is.de == 1)
+  downregulated <- sum(is.de == -1)
+  no_change <- sum(is.de == 0)
+  
+  # apply a threshold for DE genes
+  thresholded_results <- top_tags$table[
+  top_tags$table$FDR <= 0.05 & abs(top_tags$table$logFC) >= fc_threshold, ]
+  
+  return(list(
+    contrast = contrast,
+    qlf = qlf,
+    is_de = is.de,
+    summary_de = summary_de,
+    top_tags = top_tags,
+    upregulated = upregulated,
+    downregulated = downregulated,
+    no_change = no_change,
+    thresholded_results = thresholded_results
+  ))
+}
+
+# Function to plot multiple group comparisons
+plot_all_results <- function(results_list) {
+  plot_data <- do.call(rbind, lapply(results_list, function(result) {
+    data.frame(
+      Category = c("Upregulated", "Downregulated", "No Change"),
+      Count = c(result$upregulated, result$downregulated, result$no_change),
+      Comparison = result$contrast
+    )
+  }))
+  
+  plot <- ggplot(plot_data, aes(x = Comparison, y = Count, fill = Category)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = Count), 
+              position = position_dodge(width = 0.9), 
+              vjust = -0.5) +
+    labs(title = "Differential Expression Across Comparisons",
+         x = "Comparison",
+         y = "Number of Genes") +
+    theme_minimal() +
+    scale_fill_manual(values = c("Upregulated" = "green", "Downregulated" = "red", "No Change" = "gray"))
+
+  print(plot)
+}
+
+plot_thresholded_results <- function(results_list) {
+  plot_data <- lapply(results_list, function(result) {
+    thresholded_results <- result$thresholded_results
+    # Count the number of upregulated genes (logFC >= 1.0)
+    upregulated_genes <- thresholded_results[thresholded_results$logFC >= fc_threshold & thresholded_results$FDR <= 0.05, ]
+    num_upregulated <- nrow(upregulated_genes)
+    # Count the number of downregulated genes (logFC <= -1.0)
+    downregulated_genes <- thresholded_results[thresholded_results$logFC <= -fc_threshold & thresholded_results$FDR <= 0.05, ]
+    num_downregulated <- nrow(downregulated_genes)
+    
+    all <- num_downregulated + num_upregulated
+   
+    data.frame(
+      Category = c("Upregulated", "Downregulated", "ALL"),
+      Count = c(num_upregulated, num_downregulated, all),
+      Comparison = result$contrast
+    )
+  })
+
+  plot_data <- do.call(rbind, plot_data)
+  plot <- ggplot(plot_data, aes(x = Comparison, y = Count, fill = Category)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = Count), 
+              position = position_dodge(width = 0.9), 
+              vjust = -0.5) +  # Adds numbers on top of bars
+    labs(title = "Differential Expression Across Comparisons (padj <= 0.05 or |logFC| >= 0.5) ",
+         x = "Comparison",
+         y = "Number of Genes") +
+    theme_minimal() +
+    scale_fill_manual(values = c("Upregulated" = "green", "Downregulated" = "red", "ALL" = "gray"))
+  
+  print(plot)
+  return(plot_data)
+}
+
+custom_rollmean <- function(x, k = 40) {
+  n <- length(x)
+  half_window <- k / 2
+  
+  rolling_avg <- rep(NA, n)  # Initialize the rolling average vector
+  
+  # First half (start) of the series: fewer previous values
+  for (i in 1:half_window) {
+    rolling_avg[i] <- mean(x[1:(i + half_window)], na.rm = TRUE)
+  }
+  
+  # Middle part: use full window size
+  for (i in (half_window + 1):(n - half_window)) {
+    rolling_avg[i] <- mean(x[(i - half_window):(i + half_window)], na.rm = TRUE)
+  }
+  
+  # Last half (end) of the series: fewer subsequent values
+  for (i in (n - half_window + 1):n) {
+    rolling_avg[i] <- mean(x[(i - half_window):n], na.rm = TRUE)
+  }
+  
+  return(rolling_avg)
+}
+```
+
+
+```{r}
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+# region of interest
+chromosome_of_interest <- "8"
+deletion_start <- 0
+deletion_end <- 7247573
+duplication_start <- 11828865
+duplication_end <- 40361770
+
+attributes <- c(
+  "ensembl_gene_id",
+  "external_gene_name",
+  "chromosome_name",
+  "start_position",
+  "end_position",
+  "strand",
+  "gene_biotype",
+  "description"
+)
+
+# deletion region
+filters_del <- c("chromosome_name", "start", "end")
+values_del <- list(chromosome_of_interest, deletion_start, deletion_end)
+
+genes_in_deletion <- getBM(
+  attributes = attributes,
+  filters = filters_del,
+  values = values_del,
+  mart = ensembl
+)
+
+protein_coding_genes_del <- genes_in_deletion[genes_in_deletion$gene_biotype == "protein_coding", ]
+number_of_genes_del <- length(unique(protein_coding_genes_del$ensembl_gene_id))
+cat("Number of protein-coding genes in the deletion region:", number_of_genes_del, "\n")
+
+# duplication region
+filters_dup <- c("chromosome_name", "start", "end")
+values_dup <- list(chromosome_of_interest, duplication_start, duplication_end)
+
+genes_in_duplication <- getBM(
+  attributes = attributes,
+  filters = filters_dup,
+  values = values_dup,
+  mart = ensembl
+)
+
+protein_coding_genes_dup <- genes_in_duplication[genes_in_duplication$gene_biotype == "protein_coding", ]
+number_of_genes_dup <- length(unique(protein_coding_genes_dup$ensembl_gene_id))
+cat("Number of protein-coding genes in the duplication region:", number_of_genes_dup, "\n")
+
+
+protein_coding_genes_del$region <- "Deletion"
+protein_coding_genes_dup$region <- "Duplication"
+combined_genes <- rbind(protein_coding_genes_del, protein_coding_genes_dup)
+combined_genes
+
+overlapping_genes <- intersect(protein_coding_genes_del$ensembl_gene_id, protein_coding_genes_dup$ensembl_gene_id)
+if (length(overlapping_genes) > 0) {
+  cat("Genes present in both regions:\n")
+  print(overlapping_genes)
+} else {
+  cat("No genes are present in both the deletion and duplication regions.\n")
+}
+```
+### 8p analysis
+```{r}
+counts <- read.csv("data/gene_count.csv")
+samples <- read_xlsx("data/Sample List.xlsx")
+raw.counts <- counts %>% dplyr::select(gene_id, samples$`Sample Name`)
+annotation <- counts %>% dplyr::select(-all_of(samples$`Sample Name`))
+```
+
+
+```{r}
+samples.parents <- samples %>%
+  mutate(`Group Name` = ifelse(`Group Name` %in% c("MOM", "DAD"), "Parents", `Group Name`))
+print(samples.parents)
+
+y.parents <- DGEList(counts = raw.counts, samples = samples.parents, group = samples.parents$`Group Name`)
+y.parents$genes <- annotation
+keep <- filterByExpr(y.parents, min.count = 30, min.total.count = 50, large.n = 10, min.prop = 0.75) # filter lowly expressed transcripts #, min.count = 30, min.total.count = 50, large.n = 10, min.prop = 0.75
+table(keep)
+
+y.parents <- y.parents[keep, , keep.lib.sizes=FALSE]
+y.parents <- normLibSizes(y.parents) # TMM normalization
+# calculate CPM 
+log2_cpm <- cpm(y.parents, log = TRUE, prior.count = 1, normalized.lib.sizes = T)
+log2_tmm_data_with_annotations <- cbind(y.parents$genes, log2_cpm)
+
+# DE analysis
+plotMDS(y.parents)        
+
+samples.design.parents <- model.matrix(~ 0 + group,data = y.parents$samples) # design
+colnames(samples.design.parents) <- gsub("group", "", colnames(samples.design.parents))
+y.parents <- estimateDisp(y.parents, samples.design.parents, robust=TRUE)
+print(y.parents$common.dispersion)
+
+plotBCV(y.parents)
+
+fit.parents <- glmQLFit(y.parents, samples.design.parents, robust=TRUE)
+plotQLDisp(fit.parents)
+
+# make contrast
+rev.contrast <- makeContrasts(PROvsREV=PRO-REV, levels=samples.design.parents)
+
+qlf.PROvsREV <- glmQLFTest(fit.parents, contrast=rev.contrast[,"PROvsREV"])
+
+contr.rev <- get_results("PRO - REV", qlf.PROvsREV)
+
+parents_results_list <- list(contr.rev)
+plot_all_results(parents_results_list)
+table.results <- plot_thresholded_results(parents_results_list)
+
+```
+
+#### Supplementary Figure S3BC
+```{r}
+centromeres <- read_tsv("data/centromeres-UCSC.bed", comment = "#")
+
+centromeres_summary <- centromeres %>%
+  group_by(chrom) %>%
+  summarize(
+    start = min(chromStart),
+    end = max(chromEnd)
+  )
+
+sample_to_group <- samples %>%
+  dplyr::select(`Sample Name`,`Group Name`) %>%
+  dplyr::filter(`Group Name` == "REV" |`Group Name` == "PRO")
+
+gene_logfc <- contr.rev$top_tags$table %>%
+  dplyr::select(gene_id, logFC, gene_chr)  # Select relevant columns (adjust the names if needed)
+
+summary_list <- list()
+
+for (i in 1:22) {
+  chrom_gene_logfc <- gene_logfc %>%
+    filter(gene_chr == as.character(i))
+  
+  avg_logfc <- mean(chrom_gene_logfc$logFC, na.rm = TRUE)
+  median_logfc <- median(chrom_gene_logfc$logFC, na.rm = TRUE)
+  
+  summary_df <- tibble(
+    CHR = i,
+    mean_logFC = avg_logfc,
+    median_logFC = median_logfc
+  )
+  
+  summary_list[[i]] <- summary_df
+}
+
+final_summary <- bind_rows(summary_list)
+
+final_summary %>% gt()
+```
+
+```{r}
+library(grid)
+```
+
+```{r Figure S3B, S3C}
+# chr 7
+chr <- paste0("chr", 7)
+centromere_start <- centromeres_summary %>%
+  filter(chrom == chr) %>%
+  pull(start)
+centromere_end <- centromeres_summary %>%
+  filter(chrom == chr) %>%
+  pull(end)
+gene.deldup.tmm <- log2_tmm_data_with_annotations %>%
+  filter(gene_chr == as.character(7)) %>%
+  filter(!(gene_start >= centromere_start & gene_start < centromere_end)) %>%
+  dplyr::select(gene_id, gene_start, gene_end, samples$`Sample Name`) %>%
+  pivot_longer(cols = -c(gene_id, gene_start, gene_end), names_to = "Sample", values_to = "Expression") %>%
+  left_join(sample_to_group, by = c("Sample" = "Sample Name")) %>%  # Map samples to their groups
+  group_by(gene_id, gene_start, gene_end, `Group Name`) %>%
+  summarise(Average_Expression = mean(Expression, na.rm = TRUE), .groups = "drop") %>%
+  arrange(gene_start, desc(Average_Expression))
+
+gene.deldup.tmm.plot.relative.PRO <- gene.deldup.tmm %>%
+  mutate(region = case_when(
+    gene_start >= 0 & gene_start < centromere_start ~ "p",
+    gene_start >= centromere_end ~ "q"
+  )) %>%
+  filter(`Group Name` %in% c('PRO', 'REV')) %>%  # Filter for PRO and REV
+  tidyr::pivot_wider(names_from = `Group Name`, values_from = Average_Expression) %>%
+  # Calculate relative expression as PRO average minus REV average
+  mutate(relative_expression = PRO - REV) %>%
+  group_by(region) %>%
+  mutate(rolling_avg = custom_rollmean(relative_expression, k = 14)) %>%
+  ungroup()
+text_cen <- textGrob("Centromere", gp=gpar(fontsize=18, fontface="bold"))
+plot_object <- ggplot(gene.deldup.tmm.plot.relative.PRO, aes(x = (gene_start+gene_end)/2, y = rolling_avg)) +
+  theme(plot.margin = unit(c(1,1,2,1), "lines")) +
+  geom_rect(aes(xmin = centromere_start, xmax = centromere_end, ymin = -Inf, ymax = Inf),
+            fill = "grey", color = "grey", alpha = 0.6) +
+  annotation_custom(text_cen,xmin=(centromere_start + centromere_end) / 2,xmax=(centromere_start + centromere_end) / 2,ymin=-1.35,ymax=-1.35) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 0.5, alpha = 0.8 ) +
+  geom_point(size = 1.5, alpha = 0.9, color = "#727572") +
+  labs(
+    title = paste("Gene Expression on Chromosome 7 - Proband relative to Revertant"),
+    x = "Chromosome Position (bp)",
+    y = "Relative Expression Level (log2)",
+    color =NULL
+  ) +
+  scale_y_continuous(limits = c(-1, 1.5), breaks = seq(-1.5, 1.5, by = 0.5)) +
+  scale_x_continuous(expand = c(0, 0), 
+                 limits = c(0, max(gene.deldup.tmm.plot.relative.PRO$gene_end) + 2e6),
+                 breaks = seq(from = 0, to = max(gene.deldup.tmm.plot.relative.PRO$gene_end), by = 20000000),
+                 labels = c("0", "20,000,000", "40,000,000", "60,000,000", "80,000,000", "100,000,000", "120,000,000", "140,000,000")) +
+  expand_limits(x = 0, y = -1.5) +
+  theme_classic() +
+  coord_cartesian(clip = "off") +
+  theme(
+    text = element_text(family = "Arial", face = "bold"),
+    plot.title = element_text(size = 28, face = "bold", hjust = 0.5, family = "Arial"),
+    axis.title = element_text(size = 20, family = "Arial"),
+    axis.text = element_text(size = 18, family = "Arial"),
+    axis.title.x = element_text(margin = margin(t = 20)),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(plot_object)
+
+# ggsave(
+#   filename = paste("CHR7_gene_expression_plot_log2_PROvsREV.png"),
+#   plot = plot_object,
+#   width = 18,   # Adjust the width to make the canvas longer
+#   height = 6,   # Adjust the height to control the aspect ratio
+#   dpi = 300,     # Set the resolution to 300 dpi
+#   bg = "transparent"
+# )
+
+# chr 9
+chr <- paste0("chr", 9)
+centromere_start <- centromeres_summary %>%
+  filter(chrom == chr) %>%
+  pull(start)
+centromere_end <- centromeres_summary %>%
+  filter(chrom == chr) %>%
+  pull(end)
+gene.deldup.tmm <- log2_tmm_data_with_annotations %>%
+  filter(gene_chr == as.character(9)) %>%
+  filter(!(gene_start >= centromere_start & gene_start < centromere_end)) %>%
+  dplyr::select(gene_id, gene_start, gene_end, samples$`Sample Name`) %>%
+  pivot_longer(cols = -c(gene_id, gene_start, gene_end), names_to = "Sample", values_to = "Expression") %>%
+  left_join(sample_to_group, by = c("Sample" = "Sample Name")) %>%  # Map samples to their groups
+  group_by(gene_id, gene_start, gene_end, `Group Name`) %>%
+  summarise(Average_Expression = mean(Expression, na.rm = TRUE), .groups = "drop") %>%
+  arrange(gene_start, desc(Average_Expression))
+gene.deldup.tmm.plot.relative.PRO <- gene.deldup.tmm %>%
+  mutate(region = case_when(
+    gene_start >= 0 & gene_start < centromere_start ~ "p",
+    gene_start >= centromere_end ~ "q"
+  )) %>%
+  filter(`Group Name` %in% c('PRO', 'REV'), region != "c") %>%  # Filter for PRO and REV
+  tidyr::pivot_wider(names_from = `Group Name`, values_from = Average_Expression) %>%
+  # Calculate relative expression as PRO average minus REV average
+  mutate(relative_expression = PRO - REV) %>%
+  group_by(region) %>%
+  mutate(rolling_avg = custom_rollmean(relative_expression, k = 14)) %>%
+  ungroup()
+text_cen <- textGrob("Centromere", gp=gpar(fontsize=18, fontface="bold"))
+plot_object <- ggplot(gene.deldup.tmm.plot.relative.PRO, aes(x = (gene_start+gene_end)/2, y = rolling_avg)) +
+  theme(plot.margin = unit(c(1,1,2,1), "lines")) +
+  geom_rect(aes(xmin = centromere_start, xmax = centromere_end, ymin = -Inf, ymax = Inf),
+            fill = "grey", color = "grey", alpha = 0.6) +
+  annotation_custom(text_cen,xmin=(centromere_start + centromere_end) / 2,xmax=(centromere_start + centromere_end) / 2,ymin=-1.35,ymax=-1.35) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 0.5, alpha = 0.8 ) +
+  geom_point(size = 1.5, alpha = 0.9, color = "#727572") +
+  labs(
+    title = paste("Gene Expression on Chromosome 9 - Proband relative to Revertant"),
+    x = "Chromosome Position (bp)",
+    y = "Relative Expression Level (log2)",
+    color =NULL
+  ) +
+  scale_y_continuous(limits = c(-1, 1.5), breaks = seq(-1.5, 1.5, by = 0.5)) +
+  scale_x_continuous(expand = c(0, 0), 
+                 limits = c(0, max(gene.deldup.tmm.plot.relative.PRO$gene_end) + 2e6),
+                 breaks = seq(from = 0, to = max(gene.deldup.tmm.plot.relative.PRO$gene_end), by = 20000000),
+                 labels = c("0", "20,000,000", "40,000,000", "60,000,000", "80,000,000", "100,000,000", "120,000,000")) +
+  expand_limits(x = 0, y = -1.5) +
+  theme_classic() +
+  coord_cartesian(clip = "off") +
+  theme(
+    text = element_text(family = "Arial", face = "bold"),
+    plot.title = element_text(size = 28, face = "bold", hjust = 0.5, family = "Arial"),
+    axis.title = element_text(size = 20, family = "Arial"),
+    axis.text = element_text(size = 18, family = "Arial"),
+    axis.title.x = element_text(margin = margin(t = 20)),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+print(plot_object)
+
+# ggsave(
+#   filename = paste("CHR9_gene_expression_plot_log2_PROvsREV.png"),
+#   plot = plot_object,
+#   width = 18,   # Adjust the width to make the canvas longer
+#   height = 6,   # Adjust the height to control the aspect ratio
+#   dpi = 300,     # Set the resolution to 300 dpi
+#   bg = "transparent"
+# )
+```
+
+#### GSE185192 DE analysis
+```{r}
+new_counts <- read.csv("data/gene_counts_GSE185192.csv", comment.char = "#")
+
+in_both <- new_counts$Geneid %in% counts$gene_id
+all(in_both)
+
+sample_names <- c("IsoE_Rep1", "IsoE_Rep2", "IsoE_Rep3", "IsoT_Rep1", "IsoT_Rep2", "IsoT_Rep3")
+GSE185192.samples <- data.frame(
+  sample_name = sample_names,
+  group = c("DS","DS","DS","TS","TS","TS")
+)
+
+GSE185192 <- new_counts %>%
+  dplyr::select(Geneid, all_of(starts_with("aligned"))) %>%
+  dplyr::rename(gene_id = Geneid,
+                "IsoE_Rep1" = "aligned.SRR16242104.sorted.bam",
+                "IsoE_Rep2" = "aligned.SRR16242105.sorted.bam", 
+                "IsoE_Rep3" = "aligned.SRR16242106.sorted.bam", 
+                "IsoT_Rep1" = "aligned.SRR16242107.sorted.bam",
+                "IsoT_Rep2" = "aligned.SRR16242108.sorted.bam", 
+                "IsoT_Rep3" = "aligned.SRR16242109.sorted.bam")
+  
+
+GSE185192.full <- GSE185192 %>%
+  dplyr::left_join(annotation, by = "gene_id")
+
+# get counts and annotation
+GSE185192.annotation <- GSE185192.full %>% dplyr::select(-all_of(GSE185192.samples$sample_name))
+GSE185192.counts <- GSE185192.full %>% dplyr::select(gene_id, all_of(GSE185192.samples$sample_name))
+
+y.GSE185192 <- DGEList(counts = GSE185192.counts, samples = GSE185192.samples, group = GSE185192.samples$group)
+y.GSE185192$genes <- GSE185192.annotation
+
+keep <- filterByExpr(y.GSE185192, min.count = 30, min.total.count = 50, large.n = 10, min.prop = 0.75) # filter lowly expressed transcripts
+table(keep)
+
+y.GSE185192 <- y.GSE185192[keep, , keep.lib.sizes = FALSE]
+y.GSE185192 <- normLibSizes(y.GSE185192) # TMM normalization
+
+biotypes <- y.GSE185192$genes$gene_biotype
+
+# Count the occurrences of each gene biotype
+biotype_table <- table(biotypes)
+
+# Calculate the fraction of each gene biotype
+biotype_fraction <- prop.table(biotype_table)
+
+biotype_df <- data.frame(
+  Biotype = names(biotype_fraction),
+  Count = as.numeric(biotype_table),
+  Fraction = round(biotype_fraction, 3)
+)
+
+# calculate CPM
+log2_cpm.GSE185192 <- cpm(y.GSE185192, log = TRUE, prior.count = 1, normalized.lib.sizes = T)
+log2_tmm_data_with_annotations.GSE185192 <- cbind(y.GSE185192$genes, log2_cpm.GSE185192)
+colnames(log2_cpm.GSE185192) <- GSE185192.samples$sample_name
+# DE analysis
+plotMDS(y.GSE185192)
+
+samples.design <- model.matrix(~ 0 + group,data = y.GSE185192$samples) # design
+colnames(samples.design) <- gsub("group", "", colnames(samples.design))
+y.GSE185192 <- estimateDisp(y.GSE185192, samples.design, robust=TRUE)
+print(y.GSE185192$common.dispersion)
+
+plotBCV(y.GSE185192)
+
+fit <- glmQLFit(y.GSE185192, samples.design, robust=TRUE)
+plotQLDisp(fit)
+
+# make contrast
+contrast <- makeContrasts(TSvsDS=TS-DS, levels=samples.design)
+qlf.TSvsDS <- glmQLFTest(fit, contrast=contrast[,"TSvsDS"])
+contr <- get_results("TS - DS", qlf.TSvsDS)
+results_list <- list(contr)
+plot_all_results(results_list)
+table.results <- plot_thresholded_results(results_list)
+```
+### Figure 5
+```{r Figure 5B}
+chr <- paste0("chr", 21)
+centromere_start <- centromeres_summary %>%
+  filter(chrom == chr) %>%
+  pull(start)
+
+centromere_end <- centromeres_summary %>%
+  filter(chrom == chr) %>%
+  pull(end)
+
+gene.deldup.tmm <- log2_tmm_data_with_annotations %>%
+  filter(gene_chr == as.character(21)) %>%
+  filter(!(gene_start >= centromere_start & gene_start < centromere_end)) %>%
+  dplyr::select(gene_id, gene_start, gene_end, samples$`Sample Name`) %>%
+  pivot_longer(cols = -c(gene_id, gene_start, gene_end), names_to = "Sample", values_to = "Expression") %>%
+  left_join(sample_to_group, by = c("Sample" = "Sample Name")) %>%  # Map samples to their groups
+  group_by(gene_id, gene_start, gene_end, `Group Name`) %>%
+  summarise(Average_Expression = mean(Expression, na.rm = TRUE), .groups = "drop") %>%
+  arrange(gene_start, desc(Average_Expression))
+
+gene.deldup.tmm.plot.relative.PRO <- gene.deldup.tmm %>%
+  mutate(region = case_when(
+    gene_start >= 0 & gene_start < centromere_start ~ "p",
+    gene_start >= centromere_end ~ "q"
+  )) %>%
+  filter(`Group Name` %in% c('PRO', 'REV')) %>%  # Filter for PRO and REV
+  tidyr::pivot_wider(names_from = `Group Name`, values_from = Average_Expression) %>%
+  # Calculate relative expression as PRO average minus REV average
+  mutate(relative_expression = PRO - REV) %>%
+  group_by(region) %>%
+  mutate(rolling_avg = custom_rollmean(relative_expression, k = 8)) %>%
+  ungroup()
+
+## TS21
+gene.deldup.tmm.GSE185192 <- log2_tmm_data_with_annotations.GSE185192 %>%
+  filter(gene_chr == as.character(21)) %>%
+  filter(!(gene_start >= centromere_start & gene_start < centromere_end)) %>%
+  dplyr::select(gene_id, gene_start, gene_end, GSE185192.samples$sample_name) %>%
+  pivot_longer(cols = -c(gene_id, gene_start, gene_end), names_to = "Sample", values_to = "Expression") %>%
+  left_join(GSE185192.samples, by = c("Sample" = "sample_name")) %>%  # Map samples to their groups
+  group_by(gene_id, gene_start, gene_end, group) %>%
+  summarise(Average_Expression = mean(Expression, na.rm = TRUE), .groups = "drop") %>%
+  arrange(gene_start, desc(Average_Expression))
+
+
+gene.deldup.tmm.plot.relative.TS.GSE185192 <- gene.deldup.tmm.GSE185192 %>%
+  mutate(region = case_when(
+    gene_start >= 0 & gene_start < centromere_start ~ "p",
+    gene_start >= centromere_end ~ "q"
+  )) %>%
+  filter(group %in% c('TS', 'DS')) %>%  # Filter for PRO and REV
+  tidyr::pivot_wider(names_from = group, values_from = Average_Expression) %>%
+  # Calculate relative expression as PRO average minus REV average
+  mutate(relative_expression = TS - DS) %>%
+  group_by(region) %>%
+  mutate(rolling_avg = custom_rollmean(relative_expression, k = 8)) %>%
+  ungroup()
+
+plot_combined_data <- inner_join(gene.deldup.tmm.plot.relative.PRO %>% dplyr::select(gene_id, gene_start, gene_end, rolling_avg), 
+                                 gene.deldup.tmm.plot.relative.TS.GSE185192 %>% dplyr::select(gene_id, rolling_avg), by = "gene_id", suffix = c("_8p", "_21"))
+
+plot_combined_data_long <- plot_combined_data %>%
+  pivot_longer(cols = c(rolling_avg_8p, rolling_avg_21),
+               names_to = "Dataset",
+               names_prefix = "rolling_avg_",
+               values_to = "rolling_avg") %>%
+  mutate(Dataset = recode(Dataset,
+                          "8p" = "8p Proband",
+                          "21" = "Trisomy 21"))
+  
+
+text_cen <- textGrob("Centromere", gp=gpar(fontsize=18, fontface="bold"))
+
+plot_object <- ggplot(plot_combined_data_long, aes(x = (gene_start+gene_end)/2, y = rolling_avg, color = Dataset)) +
+  theme(plot.margin = unit(c(1,1,2,1), "lines")) +
+  geom_rect(aes(xmin = centromere_start, xmax = centromere_end, ymin = -Inf, ymax = Inf), 
+            fill = "grey", color = "grey", alpha = 0.6) +
+  annotation_custom(text_cen,xmin=(centromere_start + centromere_end) / 2,xmax=(centromere_start + centromere_end) / 2,ymin=-1.35,ymax=-1.35) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 0.5, alpha = 0.8 ) +
+  geom_point(size = 1.5, alpha = 0.9) + 
+  labs(
+    title = paste("Gene Expression on Chromosome 21"),
+    x = "Chromosome Position (bp)",
+    y = "Relative Expression Level (log2)",
+    color =NULL
+  ) +
+  scale_y_continuous(limits = c(-1, 1.5), breaks = seq(-1.5, 1.5, by = 0.5)) +
+  scale_x_continuous(expand = c(0, 0), 
+               limits = c(0, max(plot_combined_data_long$gene_end) + 1e7),
+               breaks = seq(from = 0, to = max(plot_combined_data_long$gene_end)+1e7, by = 10000000),
+               labels = c("0", "10,000,000", "20,000,000", "30,000,000", "40,000,000", "50,000,000")) +
+  scale_color_manual(values = c("8p Proband" = "steelblue", "Trisomy 21" = "firebrick")) +
+  expand_limits(x = 0, y = -1.5) +
+  theme_classic() +
+  coord_cartesian(clip = "off") +
+  theme(
+    text = element_text(family = "Arial", face = "bold"),
+    plot.title = element_text(size = 28, face = "bold", hjust = 0.5, family = "Arial"),
+    axis.title = element_text(size = 20, family = "Arial"),                
+    axis.text = element_text(size = 18, family = "Arial"),
+    axis.title.x = element_text(margin = margin(t = 20)),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.text = element_text(size = 16, family = "Arial")
+  ) 
+
+print(plot_object)
+
+# ggsave(
+#   filename = paste("CHR21_gene_expression_plot_log2_TS21vsDS_PROvsREV.png"),
+#   plot = plot_object,
+#   width = 18,   # Adjust the width to make the canvas longer
+#   height = 6,   # Adjust the height to control the aspect ratio
+#   dpi = 300,     # Set the resolution to 300 dpi
+#   bg = "transparent"
+# )
+
+
+mean_values_GSE185192 <- gene.deldup.tmm.plot.relative.TS.GSE185192 %>%
+  summarize(DS_mean_log2 = mean(DS, na.rm = TRUE),
+            TS_mean_log2 = mean(TS, na.rm = TRUE)) %>%
+  mutate(abs_fold_change = 2^(TS_mean_log2 - DS_mean_log2))
+
+mean_values_GSE185192
+```
+
+## filtering out 8p and chr21 genes
+```{r}
+# PRO vs REV 8p
+PRO_REV_8P_table <- contr.rev$top_tags$table %>%
+  filter(gene_biotype == "protein_coding", gene_chr %in% c(1:22,"X","Y"))
+
+# TS vs DS 21
+TS_DS_21_table <- contr$top_tags$table %>%
+  filter(gene_biotype == "protein_coding", gene_chr %in% c(1:22,"X","Y"))
+
+# write_csv(contr$top_tags$table %>% dplyr::filter(FDR <= 0.05), "DEgenes_Trisomy21.csv")
+dim(TS_DS_21_table)
+dim(PRO_REV_8P_table)
+
+region_counts21 <- TS_DS_21_table %>%
+  mutate(region = gene_chr) %>%
+  group_by(region) %>%
+  summarise(
+    total_genes = n(),
+    de_count    = sum(FDR <= 0.05),
+    .groups     = "drop"
+  ) %>%
+  mutate(fraction = de_count / total_genes) %>%
+  mutate(region = factor(region, levels = c(as.character(1:22), "X", "Y")))
+
+ggplot(region_counts21, aes(x = region, y = fraction)) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(label = scales::percent(fraction, accuracy = 0.1)),
+    vjust = -0.5,
+    size = 3
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = expansion(mult = c(0, 0.1))
+  ) +
+  labs(
+    title    = "DE Genes per Chromosome",
+    subtitle = "TS vs DS (FDR <= 0.05, protein-coding)",
+    x        = "Chromosome",
+    y        = "Fraction DE"
+  ) +
+  theme_classic(base_family = "Arial") +
+  theme(
+    plot.title    = element_text(size = 20, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title    = element_text(size = 14, face = "bold"),
+    axis.text     = element_text(size = 14),
+    axis.text.x   = element_text(hjust = 1),
+    panel.grid    = element_blank()
+  )
+
+## 8p
+
+region_counts8p <- PRO_REV_8P_table %>%
+  mutate(region = gene_chr) %>%
+  group_by(region) %>%
+  summarise(
+    total_genes = n(),
+    de_count    = sum(FDR <= 0.05),
+    .groups     = "drop"
+  ) %>%
+  mutate(fraction = de_count / total_genes) %>%
+  mutate(region = factor(region, levels = c(as.character(1:22), "X", "Y")))
+
+ggplot(region_counts8p, aes(x = region, y = fraction)) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(label = scales::percent(fraction, accuracy = 0.1)),
+    vjust = -0.5,
+    size = 3
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = expansion(mult = c(0, 0.1))
+  ) +
+  labs(
+    title    = "DE Genes per Chromosome - 8p",
+    subtitle = "PRO vs REV (FDR <= 0.05, protein-coding)",
+    x        = "Chromosome",
+    y        = "Fraction DE"
+  ) +
+  theme_classic(base_family = "Arial") +
+  theme(
+    plot.title    = element_text(size = 20, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title    = element_text(size = 14, face = "bold"),
+    axis.text     = element_text(size = 14),
+    axis.text.x   = element_text(hjust = 1),
+    panel.grid    = element_blank()
+  )
+```
+
+```{r}
+merged_FC <- inner_join(TS_DS_21_table %>%
+                          dplyr::select(-c(gene_name, gene_chr, gene_start, gene_end,gene_strand,gene_length, gene_description, gene_biotype, tf_family)), 
+                        PRO_REV_8P_table, by = "gene_id", suffix = c("_21", "_8p"))
+
+# # export as background for enrichr
+# write.table(
+#   merged_FC$gene_name,
+#   file      = "co-detected.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+```
+
+## Figure 5C
+```{r Figure 5C}
+# Spearman
+spearman_r <- cor(merged_FC$logFC_21,
+                  merged_FC$logFC_8p,
+                  use    = "complete.obs",
+                  method = "spearman")
+spearman_r
+
+spearman_test <- cor.test(merged_FC$logFC_21,
+                          merged_FC$logFC_8p,
+                          use    = "complete.obs",
+                          method = "spearman")
+
+spearman_test
+
+```
+
+## Figure 5D
+```{r Figure 5D}
+total21.filtered <- TS_DS_21_table %>%
+  dplyr::filter(
+    gene_chr      != "21",
+    !gene_id %in% combined_genes$ensembl_gene_id
+  )
+
+total8p.filtered   <- PRO_REV_8P_table %>% 
+  dplyr::filter(
+    gene_chr      != "21",
+    !gene_id %in% combined_genes$ensembl_gene_id
+  ) 
+
+
+merged_FC_filtered <- merged_FC %>%
+  dplyr::filter(
+    gene_chr      != "21",
+    !gene_id %in% combined_genes$ensembl_gene_id
+  )
+
+## protein coding gene
+up_21 <- total21.filtered %>%
+  dplyr::filter(FDR <= 0.05 & logFC > 0) %>%
+  pull(gene_name)
+
+up_8p <- total8p.filtered %>% 
+  dplyr::filter(FDR <= 0.05, logFC > 0) %>%
+  pull(gene_name)
+
+# Negative logFC (downregulated)
+down_21 <- total21.filtered %>%
+  dplyr::filter(FDR <= 0.05, logFC < 0) %>%
+  pull(gene_name)
+
+down_8p <- total8p.filtered %>% 
+  dplyr::filter(FDR <= 0.05, logFC < 0) %>%
+  pull(gene_name)
+
+
+# Upregulated (positive logFC)
+upregulated_intersected_genes <- intersect(up_21, up_8p)
+
+# Downregulated (negative logFC)
+downregulated_intersected_genes <- intersect(down_21, down_8p)
+
+cat("exclude 21 and 8p genes:")
+cat("Upregulated:", length(upregulated_intersected_genes), 
+    "\nDownregulated:", length(downregulated_intersected_genes), "\n")
+
+# write.table(
+#   upregulated_intersected_genes,
+#   file      = "enrichr_upregulated_both_filtered.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+# 
+# write.table(
+#   downregulated_intersected_genes,
+#   file      = "enrichr_downregulated_both_filtered.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+# 
+# write.table(
+#   merged_FC_filtered$gene_name,
+#   file      = "co-detected_filtered.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+
+# hypergeometric test
+N <- nrow(merged_FC_filtered)  # total number of genes in merged dataset
+
+# Upregulated in 21 that are in merged_FC
+K <- sum(up_21 %in% merged_FC_filtered$gene_name)
+
+# Upregulated in 8p that are in merged_FC
+n <- sum(up_8p %in% merged_FC_filtered$gene_name)
+
+# Shared upregulated genes that are also in merged_FC
+x <- sum(upregulated_intersected_genes %in% merged_FC_filtered$gene_name)
+
+# Run hypergeometric test
+p_value <- phyper(q = x - 1, m = K, n = N - K, k = n, lower.tail = FALSE)
+
+# Hypergeometric test (greater tail = enrichment)
+p_value <- phyper(q = x - 1, m = K, n = N - K, k = n, lower.tail = FALSE)
+
+cat("N (total tested genes):", N, "\n",
+    "K (DE up in dataset 21):", K, "\n",
+    "n (DE up in dataset 8p):", n, "\n",
+    "x (co-upregulated):", x, "\n")
+# "N (total tested genes): 12869 
+#  K (DE up in dataset 21): 1623 
+#  n (DE up in dataset 8p): 972 
+#  x (co-upregulated): 263 
+# "
+print(p_value)
+
+venn_data <- c(
+  "Invdupdel(8p)" = n-x,
+  "Trisomy 21" = K-x,
+  "Invdupdel(8p)&Trisomy 21" = x
+)
+
+venn_euler <- euler(venn_data)
+p <- plot(
+  venn_euler,
+  fills = c(
+    met.brewer("Hiroshige", n = 10)[3],
+    met.brewer("Hiroshige", n = 10)[7]
+  ),
+  labels = list(font = 1, cex = 0),
+  alpha = 0.7
+)
+
+# png("euler_plot_up.png", width = 1500, height = 1200, res = 300)
+# grid::grid.newpage()
+# # Draw the plot
+# grid::grid.draw(p)
+# 
+# # Close the file
+# dev.off()
+
+
+# hypergeometric test
+N <- nrow(merged_FC_filtered)   # total genes (universe)
+# Upregulated in 21 that are in merged_FC
+K <- sum(down_21 %in% merged_FC_filtered$gene_name)
+# Upregulated in 8p that are in merged_FC
+n <- sum(down_8p%in% merged_FC_filtered$gene_name)
+# Shared upregulated genes that are also in merged_FC
+x <- sum(downregulated_intersected_genes %in% merged_FC_filtered$gene_name)
+
+# Hypergeometric test (greater tail = enrichment)
+p_value <- phyper(q = x - 1, m = K, n = N - K, k = n, lower.tail = FALSE)
+
+cat("N (total tested genes):", N, "\n",
+    "K (DE down in dataset 21):", K, "\n",
+    "n (DE down in dataset 8p):", n, "\n",
+    "x (co-downregulated):", x, "\n")
+# "N (total tested genes): 12869 
+#  K (DE down in dataset 21): 1783 
+#  n (DE down in dataset 8p): 1153 
+#  x (co-downregulated): 269 
+# "
+print(p_value)
+
+venn_data <- c(
+  "Invdupdel(8p)" = n-x,
+  "Trisomy 21" = K-x,
+  "Invdupdel(8p)&Trisomy 21" = x
+)
+
+venn_euler <- euler(venn_data)
+p <- plot(
+  venn_euler,
+  fills = c(
+    met.brewer("Hiroshige", n = 10)[3],
+    met.brewer("Hiroshige", n = 10)[7]
+  ),
+  labels = list(font = 1, cex = 0),
+  alpha = 0.7
+)
+
+# png("euler_plot_down.png", width = 1500, height = 1200, res = 300)
+# grid::grid.newpage()
+# # Draw the plot
+# grid::grid.draw(p)
+# # Close the file
+# dev.off()
+
+```
+
+```{r}
+upregulated_8p_not_21 <- setdiff(up_8p, up_21)[setdiff(up_8p, up_21) %in% merged_FC_filtered$gene_name]
+
+cat("Upregulated in 8p but not in 21:", length(upregulated_8p_not_21), " (FDR <= 0.05) \n")
+
+downregulated_8p_not_21 <- setdiff(down_8p, down_21)[setdiff(down_8p, down_21) %in% merged_FC_filtered$gene_name]
+
+cat("Downregulated in 8p but not in 21:", length(downregulated_8p_not_21), " (FDR <= 0.05) \n")
+
+# write.table(
+#   upregulated_8p_not_21,
+#   file      = "enrichr_upregulated_8p_not_21_filtered.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+# 
+# write.table(
+#   downregulated_8p_not_21,
+#   file      = "enrichr_downregulated_8p_not_21_filtered.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+
+
+upregulated_21_not_8p <- setdiff(up_21, up_8p)[setdiff(up_21, up_8p) %in% merged_FC_filtered$gene_name]
+cat("Upregulated in 21 but not in 8p:", length(upregulated_21_not_8p), " (FDR <= 0.05) \n")
+
+downregulated_21_not_8p <- setdiff(down_21, down_8p)[setdiff(down_21, down_8p) %in% merged_FC_filtered$gene_name]
+cat("Downregulated in 21 but not in 8p:", length(downregulated_21_not_8p), " (FDR <= 0.05) \n")
+
+# write.table(
+#   upregulated_21_not_8p,
+#   file      = "enrichr_upregulated_21_not_8p_filtered.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+# 
+# write.table(
+#   downregulated_21_not_8p,
+#   file      = "enrichr_downregulated_21_not_8p_filtered.txt",
+#   quote     = FALSE,
+#   row.names = FALSE,
+#   col.names = FALSE
+# )
+```
+
+
+
+```{r}
+overlapping_genes <- intersect(protein_coding_genes_del$ensembl_gene_id, protein_coding_genes_dup$ensembl_gene_id)
+if (length(overlapping_genes) > 0) {
+  cat("Genes present in both regions:\n")
+  print(overlapping_genes)
+} else {
+  cat("No genes are present in both the deletion and duplication regions.\n")
+}
+
+```
+
+## Session Info and Citations
+```{r}
+sessionInfo()
+packages_in_use <- c( names( sessionInfo()$otherPkgs ) )
+the_citations_list <- lapply( X=packages_in_use, FUN=citation)
+the_citations_list
+```
